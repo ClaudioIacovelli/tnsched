@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tnsched"
+version = "0.0.1"
+description = "A dataset of tensor networks of known structure, and the descriptors of that structure"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2.0", "scipy>=1.13", "networkx>=3.6", "cotengra>=0.8"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Claudio Iacovelli" }]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["slow: tests that take more than a few seconds, e.g. all 168 benchmark pickles (run with -m slow)"]
+addopts = "-m 'not slow'"
