@@ -50,6 +50,8 @@
 !/results/descriptors/reference.jsonl
 !/results/descriptors/reference.meta.json
 !/results/descriptors/reference_class_table.md
+!/results/descriptors/reference_components.jsonl
 !/results/descriptors/classifier.jsonl
 !/results/descriptors/classifier.meta.json
 !/results/descriptors/classifier_class_table.md
+!/results/descriptors/classifier_components.jsonl

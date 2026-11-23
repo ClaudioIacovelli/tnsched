@@ -1,22 +1,17 @@
-"""How one network is made.
+"""How one network is made. docs/instances.md.
 
-A network is three objects (docs/instances.md), the triple `Network`: `inputs`, one tuple of index
-labels per tensor; `output`, the open labels; `size_dict`, label -> dimension. An `Instance` is
-the triple plus where it comes from (family, params, seed). Generated networks are rebuilt bit
-for bit from (family, n, its knobs, seed, chi, bond rule, legs); only structure is stored, never arrays.
-Everything computed from a network (descriptors, paths, costs) lives in other modules and in
-`results/`, keyed by id.
+A network is the triple `Network` = (inputs, output, size_dict): one tuple of index labels per tensor, the open
+labels, label -> dimension. Contraction paths refer to it by positions in `inputs`. An `Instance` is the triple plus
+where it comes from (family, params, seed); a generated one is rebuilt bit for bit from those, so only structure is
+stored, never arrays. What is computed from a network (descriptors, paths, costs) lives in other modules, keyed by id.
 
-The module reads top to bottom:
-1. graph <-> network: graph_to_tn, tn_to_graph (lossless), simplify;
-2. the families: a graph per family, checked for size, redrawn until connected;
-3. the record Instance, and generate(): the one pipeline from (family, n, seed, ...) to an
-   Instance. Its steps are the streams (graph, bond rule, legs; each its own random stream),
-   draw_connected, spread_bonds and the legs patterns above it, in the order generate runs them.
+Reading order:
+1. graph <-> network: tn_to_graph (lossless), graph_to_tn (its inverse), simplify, remove_legs;
+2. the families (networkx graphs, and our hyperedge family _hyper), their knobs, the random streams, draw_connected,
+   the bond rules, the open legs, the checks;
+3. Instance, and generate(): the one pipeline from (family, n, seed, ...) to an Instance, using section 2 in order.
 
-Sources: networkx graphs, and our own hyperedge family (_hyper). The Einsum
-Benchmark, the test set, is read by benchmark.py; suite.py says which instances make the dataset.
-Contraction paths always refer to the triple: positions in `inputs`.
+The Einsum Benchmark networks are read by benchmark.py; suite.py says which instances make the dataset.
 """
 from __future__ import annotations
 
@@ -43,21 +38,18 @@ CHI = 2                               # the default bond dimension of a generate
 
 # === 1. graph <-> network ==================================================
 #
-# One graph form serves everything: tn_to_graph is lossless (a MultiGraph), graph_to_tn is its
-# inverse, and simplify gives the simple graph that cost and structure measures want.
+# The graph G(N) of a network, a MultiGraph (two tensors can share several bonds):
 #   - a tensor is a vertex 0..n-1, in the order of `inputs`;
-#   - a bond (an index on two tensors) is an edge, key = the label, weight = log2 of its dimension;
+#   - a bond (an index on two tensors) is an edge, key = its label;
 #   - a trace (an index written twice in one tensor) is a self-loop;
-#   - a hyperedge or an open leg is a vertex ("index", e) joined to every tensor that writes it;
-#   - an index written once, on one tensor, and not open is that tensor's attribute "local".
-#
-# Where each piece of information lives. In NetworkX, G.nodes[x] is the dictionary of attributes
-# of node x, and G.edges[u, v, key] the one of an edge; both start empty and hold what we put in.
-#   edge       {"weight": log2 d}                      every bond, trace and leg-to-vertex edge
-#   tensor     {"local": [...], "local_weight": [...]} only if it has local indices, else {}
-#   index node {"open": False}                         a hyperedge
-#              {"open": True, "pos": i}                an open leg, i = its axis in the output
-# A trace is NOT a local index: it is an edge (a self-loop), because its label is written twice.
+#   - a hyperedge (an index on three or more tensors) or an open leg is a vertex ("index", e), joined to every
+#     tensor that writes it;
+#   - an index written once, on one tensor, and not open (summed inside that tensor) is the tensor's attribute.
+# In networkx, G.nodes[x] is the dict of attributes of node x and G.edges[u, v, key] that of an edge:
+#   edge        {"weight": log2 d}                        every edge
+#   tensor      {"local": [labels], "local_weight": [log2 d]}   only if it has such indices, else {}
+#   index node  {"open": False}                           a hyperedge
+#               {"open": True, "pos": i}                  an open leg, i = its axis in the output
 
 def _carriers(inputs: Inputs) -> dict[str, dict[int, int]]:
     """Index label -> {tensor: how many times that tensor writes it}."""
@@ -72,38 +64,26 @@ def _carriers(inputs: Inputs) -> dict[str, dict[int, int]]:
 
 def _add_index_vertex(G: nx.MultiGraph, e: str, writes: dict[int, int], weight: float,
                       output: Output) -> None:
-    """A hyperedge or an open leg e: a vertex of its own, one edge per time a tensor writes it.
+    """Add the vertex ("index", e) of a hyperedge or open leg e, with one edge per time a tensor writes e.
 
-    An edge joins exactly two tensors, so an index that is shared by three or more (a hyperedge,
-    the COPY tensor) or that leaves the network (an open leg) cannot be an edge.
-    It becomes a vertex instead, and each tensor that writes it is joined to that vertex."""
-    # The vertex name is ONE object, the tuple ("index", e), e.g. ("index", "h"). A tuple can be a
-    # node name, and it cannot be mistaken for a tensor, whose name is an integer 0..n-1.
-    name = ("index", e)
-    # `e in output` is True or False: is e one of the open labels? Stored as the attribute "open".
-    G.add_node(name, open=e in output)
+    An edge joins exactly two tensors, so an index on three or more (a hyperedge: a COPY tensor) or one that leaves
+    the network (an open leg) becomes a vertex of its own instead."""
+    name = ("index", e)                    # one object, a tuple: never mistaken for a tensor, an integer 0..n-1
+    G.add_node(name, open=e in output)     # open: is e one of the output's labels?
     if e in output:
-        # The graph has no order, but the output does (einsum "ab->ba" is a transpose): keep the
-        # axis number so that graph_to_tn can put the open legs back in the same order.
+        # the output has an order (einsum "ab->ba" is a transpose): keep the axis, for graph_to_tn
         G.nodes[name]["pos"] = output.index(e)
     for v, times in writes.items():
         for j in range(times):
-            # Two edges between the same two nodes are told apart by their key. Usually a tensor
-            # writes e once and the key is e. If it writes e twice (T[h,h,x] with h also on other
-            # tensors, sum_h T[h,h,x] A[h,y] B[h,z]) it needs TWO edges to the vertex, and the
-            # same key would make NetworkX keep only one: the second one is keyed (e, 1).
+            # parallel edges are told apart by their key. A tensor that writes e twice (T[h,h,x], h also on other
+            # tensors) needs TWO edges to the vertex; with one key networkx would keep one, so the second is (e, 1)
             key = e if j == 0 else (e, j)
             G.add_edge(v, name, key=key, weight=weight)
 
 
 def tn_to_graph(inputs: Inputs, output: Output, size_dict: SizeDict) -> nx.MultiGraph:
-    """The lossless graph G(N) of a network (conventions above). graph_to_tn(G) gives the network
-    back, up to the names of the labels and the order of the axes inside a tensor.
-
-    Open legs: the vertex ("index", e) has open=True and pos = output.index(e); hyperedges have
-    open=False. Local indices: G.nodes[v]["local"] (labels) and ["local_weight"] (their log2 d).
-    A tensor with no index is an isolated vertex; disconnected parts give a disconnected graph.
-    G has more than n vertices when there are hyperedges or legs: the tensors are the integers."""
+    """The lossless graph G(N) of a network (conventions above). graph_to_tn(G) gives the network back, up to the
+    names of the labels and the order of the axes inside a tensor. A tensor with no index is an isolated vertex."""
     G = nx.MultiGraph()
     G.add_nodes_from(range(len(inputs)))
     for e, writes in _carriers(inputs).items():
@@ -112,35 +92,29 @@ def tn_to_graph(inputs: Inputs, output: Output, size_dict: SizeDict) -> nx.Multi
         if e in output or places > 2:               # an open leg or a hyperedge: a vertex
             _add_index_vertex(G, e, writes, weight, output)
         elif places == 2:                           # a bond, or a trace
-            tensors = list(writes)                  # the tensors that write e: two for a bond,
-            if len(tensors) == 1:                   # one for a trace (T[a,a,b], summed over a):
-                u = v = tensors[0]                  # both ends are that tensor, a self-loop
+            tensors = list(writes)                  # two tensors for a bond, one for a trace (T[a,a,b]):
+            if len(tensors) == 1:                   # then both ends are that tensor, a self-loop
+                u = v = tensors[0]
             else:
                 u, v = tensors
             G.add_edge(u, v, key=e, weight=weight)
         else:
-            # Written once and not open: summed inside its own tensor against nothing, as b is in
-            # sum_{b,c} T[a,b,c] M[c,d]. No second tensor, so no edge: it is a feature of the
-            # tensor, kept as node attributes so that graph_to_tn can write it back. `writes` has
-            # one entry, {tensor: 1}, and (v,) = writes unpacks that one key.
+            # written once and not open (b in sum_{b,c} T[a,b,c] M[c,d]): no second tensor, so no edge; kept on the
+            # tensor so that graph_to_tn can write it back. writes = {tensor: 1}; (v,) = writes takes its one key
             (v,) = writes
-            # setdefault("local", []) returns the list stored under "local", creating an empty
-            # one the first time; a tensor can have several local indices.
+            # setdefault returns the list under "local", creating it empty the first time
             G.nodes[v].setdefault("local", []).append(e)
             G.nodes[v].setdefault("local_weight", []).append(weight)
     return G
 
 
 def simplify(G: nx.MultiGraph) -> nx.Graph:
-    """The simple graph of a tn_to_graph graph: parallel bonds between two tensors merged into one
-    edge whose weight is the sum (two bonds act as one of dimension d1*d2: exact for cost),
-    self-loops dropped (a trace is summed inside its tensor before any contraction). Vertices and
-    their attributes stay, so isolated tensors and disconnected parts stay as they are; edge keys
-    (the labels) are lost.
+    """The simple graph of a tn_to_graph graph; every vertex and its attributes stay, the labels (keys) go.
 
-    An edge between a tensor and an index vertex counts ONCE, however often the tensor writes that
-    index (T[h,h,x]: two edges, keys h and (h, 1)): the index is one leg of the COPY tensor, of
-    dimension d, and the repeats are a diagonal. So its weight is log2 d, not m*log2 d."""
+    Parallel bonds become one edge whose weight is the sum: two bonds act as one of dimension d1 * d2, exact for cost.
+    Self-loops go: a trace is summed inside its tensor before any contraction. A tensor that writes an index vertex
+    several times (T[h,h,x]: keys h and (h, 1)) keeps one edge of weight log2 d, not m log2 d: the repeats are a
+    diagonal of the one COPY leg."""
     H = nx.Graph()
     H.add_nodes_from(G.nodes(data=True))
     for u, v, weight in G.edges(data="weight", default=1.0):
@@ -156,10 +130,8 @@ def simplify(G: nx.MultiGraph) -> nx.Graph:
 
 
 def remove_legs(G: nx.Graph) -> nx.Graph:
-    """G without the pendant open-leg vertices: an ("index", e) vertex with open=True and one
-    neighbour (a leg on one tensor; the mirror of _attach_legs). An open index shared by two or more
-    tensors stays: it is a hyperedge of the network. Every other vertex and edge, and every
-    attribute, is kept; G itself is not changed."""
+    """A copy of G without the open legs on one tensor (open index vertices of degree 1; the mirror of
+    _attach_legs). An open index on two or more tensors stays: it is a hyperedge of the network."""
     H = G.copy()
     H.remove_nodes_from([v for v in G if _is_index_vertex(G, v) and G.nodes[v]["open"] and G.degree(v) == 1])
     return H
@@ -171,16 +143,13 @@ def _is_index_vertex(G: nx.Graph, v: Any) -> bool:
 
 
 def graph_to_tn(G: nx.Graph, chi: int = CHI) -> Network:
-    """A graph -> a network: the inverse of tn_to_graph, and the constructor of the networkx families.
+    """Any networkx graph -> a network: the inverse of tn_to_graph, and how the networkx families become networks.
 
-    In: any networkx graph, simple or multi. One tensor per vertex, one index per edge (parallel
-    edges are several indices, a self-loop is one index written twice: a trace), of dimension
-    2**weight if the edge has a weight, else chi. A vertex ("index", e) with the attribute `open`
-    is one index shared by all its neighbours: a hyperedge, or, if open=True, an open leg that goes
-    to the output in the order of its attribute "pos". G.nodes[v]["local"] adds indices local to v.
-    Out: (inputs, output, size_dict). The output is () unless the graph has open legs: a graph of
-    the networkx families gives a closed network, so N is a number (graph_to_tn(grid_2d_graph(2, 2))
-    is the 2x2 example of docs/instances.md). Nothing is refused; labels are a, b, c, ... in edge order."""
+    One tensor per vertex, one index per edge (a self-loop is a trace), of dimension 2**weight, or chi on an edge
+    without a weight. A vertex ("index", e) is one index on all its neighbours; with open=True it goes to the output at
+    its "pos". G.nodes[v]["local"] adds indices local to v. A plain graph gives a closed network: the output is ()
+    (graph_to_tn(nx.grid_2d_graph(2, 2)) is the 2 x 2 example of docs/instances.md). Labels are a, b, c, ... in
+    edge order."""
     G = nx.MultiGraph(G)                    # every edge now has a key (0 in a simple graph)
     size_dict: SizeDict = {}
 
@@ -190,8 +159,8 @@ def graph_to_tn(G: nx.Graph, chi: int = CHI) -> Network:
         size_dict[label] = chi if weight is None else round(2.0 ** weight)
         return label
 
-    # Pass 1: one label per index. A hyperedge or leg is named once, by its vertex, however many
-    # edges go to it; a bond or a trace is named by its edge (the two ends, the key).
+    # Pass 1: one label per index. A hyperedge or leg is named once, by its vertex; a bond or a trace by its edge
+    # (its two ends and its key).
     name: dict[Any, str] = {}
     for u, v, key, weight in G.edges(keys=True, data="weight"):
         if _is_index_vertex(G, u) or _is_index_vertex(G, v):
@@ -201,9 +170,8 @@ def graph_to_tn(G: nx.Graph, chi: int = CHI) -> Network:
         else:
             name[frozenset((u, v)), key] = new(weight)
 
-    # Pass 2: the tensors, in node order (the vertices that are not index vertices). The labels of
-    # one tensor: one per edge at it (a trace twice, G.edges(t) lists a self-loop once), then its
-    # local indices.
+    # Pass 2: the tensors, in node order. The labels of one tensor: one per edge at it (a trace twice: G.edges(t)
+    # lists a self-loop once), then its local indices.
     inputs: Inputs = []
     for t in (v for v in G.nodes if not _is_index_vertex(G, v)):
         term: list[str] = []
@@ -238,22 +206,17 @@ def _smallworld(n: int, seed: int, degree: int, p: float) -> nx.Graph:
     return nx.newman_watts_strogatz_graph(n, degree, p, seed=seed)
 
 
-# family name -> f(n, seed, **knobs) -> nx.Graph, where `knobs` are the family's KNOBS (below), all of
-# them given by the caller: the functions themselves hide no default.
-# `lambda n, s: ...` is a one-line function, the
-# same as `def f(n, s): return ...`. generate looks the family up here; suite.build() and the
-# tests loop over its keys. One family per kind: the dimension `dim` of the space (of the lattice,
-# or of the box a geometric graph lives in; networkx's own name) is a knob, and so is the degree
-# of a random regular graph.
+# family -> f(n, seed, **knobs) -> nx.Graph; the knobs are the family's KNOBS (below), all given by the caller, so
+# no function hides a default. `lambda n, s: ...` is a one-line function, `def f(n, s): return ...`.
 #   lattice     tensors on a dim-dimensional grid, bonds between nearest neighbours.
 #   randreg     every tensor has exactly `degree` bonds, partners paired at random: no geometry.
-#   geometric   n points drawn uniformly in the unit dim-cube, a bond between two points closer
-#               than r = r_scale / n**(1/dim). r shrinks with n, so the mean degree stays about
-#               fixed as n grows.
-# A fixed mean degree makes isolated pieces ever more likely, so the r_scale of a suite is chosen
-# for few redraws (draw_connected). Measured over seeds 0-9, n = 16..1024, redraws at most:
-#   dim 2, r_scale 1.8  (1.6 needs up to 22 at n = 1024, 1.8 at most 3);
-#   dim 3, r_scale 1.4: at most 6, mean degree 6-9 (1.6 needs at most 2 but gives 11-14).
+#   geometric   n points uniform in the unit dim-cube, a bond between two points closer than r = r_scale / n**(1/dim):
+#               r shrinks with n, so the mean degree stays about fixed.
+#   smallworld  a ring plus random shortcuts (_smallworld).
+#   tree        a uniformly random labelled tree.
+# At a fixed mean degree a geometric graph falls apart more often as n grows, so a suite's r_scale is chosen for few
+# redraws (draw_connected). Most redraws over seeds 0-9, n = 16..1024: dim 2, r_scale 1.8: 3 (1.6: 22 at n = 1024);
+# dim 3, r_scale 1.4: 6, mean degree 6-9 (1.6: 2, but mean degree 11-14).
 FAMILIES: dict[str, Callable[..., nx.Graph]] = {
     "lattice":     lambda n, s, dim: nx.grid_graph(dim=[side(n, dim)] * dim),
     "randreg":     lambda n, s, degree: nx.random_regular_graph(degree, n, seed=s),
@@ -277,11 +240,9 @@ def _unused_labels(size_dict: SizeDict, count: int) -> list[str]:
 
 
 def _hyper(n: int, seed: int, degree: int, hyper_share: float, rank: int, chi: int) -> Network:
-    """Our hyperedge family: a random `degree`-regular graph turned into a network (chi per bond),
-    plus round(hyper_share * n) new indices, each written on `rank` distinct tensors drawn uniformly
-    (all of dimension chi). Closed: no open legs of its own, those come from LEGS as for every family.
-    Why not cotengra's rand_equation: there the rank of a hyperedge is a random number between 3 and
-    n, so about n/2 and not a knob; here it is one."""
+    """Our hyperedge family: a random `degree`-regular network (chi per bond) plus round(hyper_share * n) new indices
+    of dimension chi, each on `rank` distinct tensors drawn uniformly. Closed: the legs come from LEGS, as for every
+    family. Not cotengra's rand_equation: there the rank of a hyperedge is random in 3..n, here it is a knob."""
     inputs, output, size_dict = graph_to_tn(nx.random_regular_graph(degree, n, seed=seed), chi)
     inputs = [tuple(term) for term in inputs]
     rng = np.random.default_rng([seed, 1])          # the hyperedges' own stream, apart from the graph's
@@ -298,9 +259,8 @@ HYPER = "hyper"                  # not a graph: a regular graph plus hyperedges 
 
 # --- the knobs ----------------------------------------------------------------------
 
-# family -> the names of its knobs, in the order Instance.params["knobs"] stores them. generate needs
-# every one of them: no number is chosen here, suite.py says which values make the dataset. The
-# names are the arguments of the draw (FAMILIES, _smallworld, _hyper); a family with no knobs has ().
+# family -> the names of its knobs, the arguments of its draw, in the order params["knobs"] stores them. generate
+# needs every one; their values are chosen in suite.py.
 #   lattice     dim: the dimension of the grid (n = L**dim).
 #   randreg     degree: bonds per tensor.
 #   geometric   dim: the dimension of the box; r_scale: the bond radius in units of n**(-1/dim).
@@ -318,8 +278,8 @@ KNOBS: dict[str, tuple[str, ...]] = {
 
 # --- the streams and the draw ----------------------------------------------------------
 
-# One stored seed, three independent random streams: SeedSequence([seed, stream, attempt]). Changing
-# what one stream decides (the bond rule, the legs) cannot change what another one decided.
+# One stored seed, three independent random streams, SeedSequence([seed, stream, attempt]): the graph, the bond
+# dimensions, the legs. Changing the bond rule or the legs cannot change the graph.
 STREAM_GRAPH, STREAM_BONDS, STREAM_LEGS = 0, 1, 2
 
 
@@ -356,18 +316,12 @@ CONNECT_TRIES = 100              # draw_connected gives up after this many attem
 
 def draw_connected(draw: Callable[[int], Network], seed: int,
                    tries: int = CONNECT_TRIES) -> tuple[Inputs, Output, SizeDict, int]:
-    """Redraw until the graph of the network is connected; n never changes.
+    """(inputs, output, size_dict, attempt): the first connected network that draw(s) gives, attempt a drawing from
+    the seed of (seed, STREAM_GRAPH, a). ValueError after `tries` attempts.
 
-    In: draw(s) -> one network from an integer seed s. Attempt a uses the seed made from
-    (seed, STREAM_GRAPH, a). Out: the first connected network (inputs, output, size_dict) and its
-    attempt number, so
-    (family, n, seed) rebuilds it bit for bit. Raises ValueError after `tries` attempts.
-
-    Rejection sampling keeps the first connected draw, and that is an exact draw from the family
-    conditioned on connectivity: attempts are independent and a draw is accepted with the same
-    probability whatever it looks like. CONNECTED_BY says which families need it at all.
-    Why connected: a closed network in k pieces is the product of k independent networks, which
-    teaches the scheduler nothing new and puts lambda_2 = 0 into the class labels of the descriptors."""
+    Keeping the first connected draw is an exact draw from the family conditioned on being connected: attempts are
+    independent, and every connected draw is accepted alike. Why connected: a closed network in k pieces is a product
+    of k networks, which teaches the scheduler nothing and puts lambda_2 = 0 in the descriptors."""
     for attempt in range(tries):
         inputs, output, size_dict = draw(_graph_seed(seed, attempt))
         if nx.is_connected(simplify(tn_to_graph(inputs, output, size_dict))):
@@ -376,8 +330,7 @@ def draw_connected(draw: Callable[[int], Network], seed: int,
 
 
 def _draw_function(family: str, n: int, chi: int, knobs: dict[str, Any]) -> Callable[[int], Network]:
-    """draw(s) -> one network of the family from seed s; `knobs` are all of the
-    family's. The arguments were validated by _check_args."""
+    """draw(s) -> one network of the family from the integer seed s, for draw_connected."""
     if family == HYPER:
         def draw_hyper(s: int) -> Network:
             return _hyper(n, s, chi=chi, **knobs)
@@ -395,12 +348,11 @@ BOND_RULES = ("uniform", "spread")
 
 def spread_bonds(size_dict: SizeDict, rng: np.random.Generator,
                  log2_range: tuple[int, int] = (1, 4)) -> SizeDict:
-    """The second bond rule (docs/instances.md): log2 d_e drawn per index, uniformly from
-    log2_range, both ends included, with the generator `rng` (generate passes _bonds_rng(seed)).
-    With uniform chi the cost depends on the structure alone; with dimensions spread over 2..16 a
-    few large contractions dominate, and an order that ignores sizes goes wrong (the Einsum
-    Benchmark has such spreads). It has its own stream, so the graph is the one the uniform rule
-    gives; only the dimensions change."""
+    """The bond rule "spread": log2 d of every index drawn uniformly from log2_range, ends included (d = 2..16).
+
+    With one chi the cost depends on the structure alone; with spread dimensions a few large contractions dominate,
+    and an order that ignores sizes goes wrong (the Einsum Benchmark has such spreads). generate passes
+    _bonds_rng(seed): the graph stays the one of the uniform rule."""
     low, high = log2_range
     exponents = rng.integers(low, high + 1, size=len(size_dict)).tolist()
     return {e: 2 ** x for e, x in zip(sorted(size_dict), exponents)}
@@ -429,23 +381,18 @@ def _tensor_neighbours(inputs: Inputs) -> dict[int, set[int]]:
 
 
 def _legs_region(inputs: Inputs, k: int, rng: np.random.Generator) -> list[int]:
-    """The k tensors of a breadth-first ball around a random tensor: a connected block, as for a
-    reduced density matrix. Tensors at equal distance are taken in an order drawn by the RNG.
-    The ball always reaches k tensors: generate gives a connected network and k <= n."""
-    neighbours = _tensor_neighbours(inputs)
+    """The k tensors nearest to a random tensor: a connected block, as for a reduced density matrix. Ties at the last
+    distance are broken at random. k tensors are always reached: the network is connected and k <= n."""
+    G = nx.Graph(_tensor_neighbours(inputs))       # tensor graph: an edge where two tensors share an index
     start = int(rng.integers(len(inputs)))          # 1. the centre: one tensor, uniformly
-    layer = [start]                                 # 2. layer d = the tensors at distance d from it
-    seen = {start}
     ball: list[int] = []
-    while layer and len(ball) < k:
-        # 3. shuffle the layer and take as many as are still needed: the last layer is cut at random
-        shuffled = [int(v) for v in rng.permutation(layer)]
+    for layer in nx.bfs_layers(G, start):           # 2. layer d = the tensors at distance d from it
+        if len(ball) == k:
+            break
+        # 3. take as many as are still needed, in a random order; sorted first, so the order networkx lists the
+        #    layer in cannot change the draw
+        shuffled = [int(v) for v in rng.permutation(sorted(layer))]
         ball += shuffled[: k - len(ball)]
-        # 4. the next layer: neighbours of this one that were not seen. Sorted, so that the order
-        #    of a set (which Python does not fix) cannot change what the RNG then shuffles.
-        reached = {u for v in layer for u in neighbours[v]}
-        layer = sorted(reached - seen)
-        seen.update(layer)
     return ball
 
 
@@ -458,13 +405,12 @@ def _legs_mps(inputs: Inputs, k: int, rng: np.random.Generator) -> list[int]:
 LEGS: dict[str, Callable[..., list[int]]] = {
     "closed": _legs_none, "scattered": _legs_scattered, "region": _legs_region, "mps": _legs_mps,
 }
+LEGS_WITH_K = ("scattered", "region")      # the patterns whose k the caller chooses (closed has 0, mps n)
 
 
 def _attach_legs(network: Network, tensors: list[int], d_open: int) -> Network:
-    """The network with one new open leg on each tensor of `tensors` (a tensor listed twice gets
-    two): each leg is a fresh label of dimension d_open, written on that tensor and appended to the
-    output, after any legs the network has. Deterministic: the tensors come from a LEGS pattern.
-    Connectivity cannot change: a leg joins no second tensor."""
+    """The network with one new open leg per entry of `tensors` (a tensor listed twice gets two): a fresh label of
+    dimension d_open on that tensor, appended to the output. A leg joins no second tensor: connectivity stays."""
     inputs, output, size_dict = network
     new_inputs = [tuple(term) for term in inputs]
     new_sizes = dict(size_dict)
@@ -546,9 +492,8 @@ def _check_hyper(family: str, n: int, degree: int, hyper_share: float, rank: int
         raise ValueError(f"rank must be an int in 3..n = {n} (tensors per hyperedge), not {rank!r}")
 
 
-# family -> check(family, n, **knobs): n (an int, at least the family's minimum) and the knobs'
-# values, before any draw, so that a size the family cannot have fails with its reason, not with
-# networkx's own error. Every family has its entry; _check_args runs it.
+# family -> check(family, n, **knobs) of n and the knob values, before any draw: a size the family cannot have fails
+# with its reason, not with networkx's error.
 CHECKS: dict[str, Callable[..., None]] = {
     "lattice": _check_lattice, "tree": _check_tree,
     "randreg": _check_randreg, "geometric": _check_geometric,
@@ -564,7 +509,7 @@ def _check_legs(legs: str, k: int, n: int) -> None:
         raise ValueError(f"legs='closed' has no legs, but k = {k}")
     if legs == "mps" and k not in (0, n):               # k = 0 is the default: it means n
         raise ValueError(f"legs='mps' puts one leg on each of the n = {n} tensors, but k = {k}")
-    if legs in ("scattered", "region") and k < 1:
+    if legs in LEGS_WITH_K and k < 1:
         raise ValueError(f"legs={legs!r} needs k >= 1, not k = {k}")
     if legs == "region" and k > n:
         raise ValueError(f"legs='region' needs k <= n = {n}, not k = {k}")
@@ -572,10 +517,9 @@ def _check_legs(legs: str, k: int, n: int) -> None:
 
 def _check_args(family: str, n: int, seed: int, chi: int, bonds: str, d_open: int | None,
                 legs: str, k: int, knobs: dict[str, Any]) -> None:
-    """Every bad argument of generate() is a ValueError raised here, with its reason, before
-    anything is drawn: the family and its knobs (exactly KNOBS[family]), seed (an int >= 0), chi and d_open (ints >= 2),
-    the bond rule, k (an int), then n and the knobs' values (what the family's CHECKS say), then the
-    legs pattern with k and n (_check_legs). d_open is None when left at chi."""
+    """Every refusal of generate(), before anything is drawn: the family, seed (int >= 0), chi and d_open (ints >= 2;
+    d_open None means chi), the bond rule, k (int), the knob names (exactly KNOBS[family]), then n and the knob values
+    (CHECKS), then legs with k and n (_check_legs)."""
     if not isinstance(family, str) or family not in KNOBS:
         raise ValueError(f"unknown family {family!r}; known: {list(KNOBS)}")
     if not _is_int(seed) or seed < 0:
@@ -607,19 +551,20 @@ def network_id(inputs: Inputs, output: Output, size_dict: SizeDict) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
-# @dataclass writes __init__ (and __repr__, __eq__) from the annotated fields below, in their
-# order: Instance(inputs, output, size_dict, family, params, seed). There is no hand-written
-# __init__ to look for. frozen=True forbids reassigning a field, so what the cached properties
-# computed from the fields stays true.
+def member_name(family: str, knobs: dict[str, Any]) -> str:
+    """The class of an instance in tables: "benchmark", else the family and its knobs ("lattice-dim3")."""
+    return "benchmark" if family == "benchmark" else "-".join([family, *(f"{k}{v}" for k, v in knobs.items())])
+
+
+# @dataclass writes __init__, __repr__ and __eq__ from the annotated fields, in their order:
+# Instance(inputs, output, size_dict, family, params, seed). frozen=True forbids reassigning a field, so the cached
+# properties computed from the fields stay true.
 @dataclass(frozen=True)
 class Instance:
-    """One network: what defines it and where it came from; nothing derived is stored.
+    """One network and where it came from; nothing derived is stored.
 
-    `family` is provenance, not a label to predict: it serves the split of train and test by class
-    (the held-out-class evaluation), per-class tables, and rebuilding from (family, n, seed).
-    Labels (costs, widths, times, best paths) live in results/, keyed by id.
-
-    == compares field by field, provenance included; `id` compares the network alone."""
+    `family` is provenance, not a label: it serves the held-out-class split, per-class tables and the rebuild.
+    == compares every field, provenance included; `id` compares the network alone."""
     inputs: Inputs
     output: Output
     size_dict: SizeDict
@@ -628,7 +573,7 @@ class Instance:
                               # legs, k, d_open, log2_output, log2_total; benchmark: n, name, category, paths
     seed: int | None          # None for the benchmark
 
-    # What follows is computed on demand. A cached_property runs once, on first access.
+    # computed on demand: a property on every access, a cached_property once, on the first
     @property
     def network(self) -> Network:
         """The triple: what contraction paths refer to (positions in `inputs`)."""
@@ -636,7 +581,8 @@ class Instance:
 
     @property
     def name(self) -> str:
-        """A readable name, unique within a suite: the family, n, every knob, chi, the bond rule, the legs and the seed."""
+        """A readable name, unique within a suite: the family, n, every knob, chi, the bond rule, the legs and the
+        seed."""
         p = self.params
         if self.family == "benchmark":
             return f"benchmark-{p['name']}"
@@ -651,30 +597,25 @@ class Instance:
 
     @cached_property
     def graph(self) -> nx.MultiGraph:
-        """G(N) = tn_to_graph(...), the lossless graph; never saved. Cost and structure measures
-        take simplify(inst.graph)."""
+        """G(N), the lossless graph (tn_to_graph); never saved."""
         return tn_to_graph(self.inputs, self.output, self.size_dict)
 
     @cached_property
     def core(self) -> nx.Graph:
-        """H = remove_legs(simplify(self.graph)): the same network simplified and closed, the only graph the
-        descriptors read. simplify drops the self-loops (traces), merges parallel bonds into one edge (their log2
-        dimensions add) and counts an index that one tensor writes twice once; remove_legs drops the pendant open legs,
-        so that the class of a network does not depend on its legs. With bonds only, H is the graph of the network,
-        tensors and bonds. Kept: every tensor (an isolated one too), local indices as attributes, hyperedges (a vertex
-        joined to its tensors), and open indices on two or more tensors."""
+        """H: G(N) simple (simplify) and without its open legs (remove_legs), the only graph the descriptors read.
+        Without legs the class of a network does not depend on them. With bonds only, H is tensors and bonds;
+        hyperedges stay as index vertices."""
         return remove_legs(simplify(self.graph))
 
     @cached_property
     def components(self) -> int:
-        """Connected pieces of G(N), counted on the core (legs are leaves: same number): 1 for every
-        generated instance; the benchmark's as they come."""
+        """The number of connected pieces (of the core; legs change nothing): 1 for every generated instance."""
         return nx.number_connected_components(self.core)
 
     @cached_property
     def member(self) -> str:
-        """The class of the instance in tables: "benchmark", else the family and its knobs ("lattice-dim3")."""
-        return "benchmark" if self.family == "benchmark" else "-".join([self.family, *(f"{k}{v}" for k, v in self.params["knobs"].items())])
+        """The class of the instance in tables: member_name of its family and knobs."""
+        return member_name(self.family, self.params.get("knobs", {}))
 
     @cached_property
     def id(self) -> str:
@@ -683,12 +624,11 @@ class Instance:
 
 
 def _log2_sizes(output: Output, size_dict: SizeDict) -> tuple[float, float]:
-    """(log2 of the number of entries of the output tensor, log2_total: the sum of log2 d over ALL
-    the indices of the network). log2_total bounds every contraction path from above, without
-    searching for one: a step multiplies the dimensions of at most all the indices, so every
-    intermediate has at most 2**log2_total entries (W <= log2_total) and every step costs at most
-    2**log2_total, so a path costs at most (n - 1) * 2**log2_total. With log2_total < 1000 (and
-    n < 2**24) no cost can overflow a float64, whatever order is used."""
+    """(log2_output, log2_total): log2 of the entries of the output tensor; the sum of log2 d over ALL indices.
+
+    log2_total bounds every path without a search: a step involves at most all the indices, so every intermediate has
+    at most 2**log2_total entries (W <= log2_total) and a path costs at most (n - 1) 2**log2_total. With
+    log2_total < 1000 and n < 2**24 no cost overflows a float64."""
     log2_output = float(sum(np.log2(size_dict[e]) for e in output))
     log2_total = float(sum(np.log2(d) for d in size_dict.values()))
     return log2_output, log2_total
@@ -699,22 +639,15 @@ def generate(family: str, n: int, seed: int, chi: int = CHI, bonds: str = "unifo
     """One instance, bit for bit from (family, n, seed, chi, bond rule, legs, k, d_open, knobs).
 
     The steps, in order:
-      1. refuse what makes no sense, before drawing anything (_check_args): a
-         ValueError, with its reason, for any bad argument: unknown family, bond rule, legs
-         pattern or knob, a wrong type, a size the family cannot have, a k the pattern cannot
-         place. `knobs` are the family's own (KNOBS), every one of them;
-      2. draw the network: hyper, _hyper (a regular graph plus hyperedges, closed); any other
-         family, its graph turned into a closed network by graph_to_tn, chi per bond;
-         redrawn until the graph is connected (draw_connected);
-      3. bonds="spread": the dimensions are redrawn by spread_bonds; the structure stays;
-      4. legs (LEGS) and k: pick the tensors that carry the open legs (k of them; "mps": all n), and
-         give each a leg of dimension d_open (default chi), appended to the output. How many legs
-         make a sensible instance is the suite's question (the k of a recipe, suite._legs_args), not this function's;
-      5. sizes: params["log2_output"] is the log2 of the number of entries of the output tensor,
-         params["log2_total"] the sum of log2 d over all indices (_log2_sizes says what that bounds).
-    No search runs here and nothing is limited: a cost is never formed as a float64 in this module,
-    and whoever asks for one checks log2_total (or the log2 of the cost) against 1023 first.
-    Memory is not checked here."""
+      1. _check_args: a ValueError with its reason for any bad argument, before anything is drawn. `knobs` are
+         every knob of the family (KNOBS);
+      2. draw the closed network (_hyper, or the family's graph through graph_to_tn, chi per bond) until it is
+         connected (draw_connected);
+      3. bonds="spread": new dimensions (spread_bonds), same structure;
+      4. legs: the LEGS pattern picks the k tensors that carry an open leg ("mps": all n), each of dimension d_open
+         (default chi). How many legs is the suite's choice (suite._legs_k);
+      5. params["log2_output"], params["log2_total"] (_log2_sizes).
+    No cost is formed here: whoever forms one checks log2_total against 1023 first."""
     _check_args(family, n, seed, chi, bonds, d_open, legs, k, knobs)
     d_open = chi if d_open is None else d_open
     knobs = {name: knobs[name] for name in KNOBS[family]}      # the stored order, whatever the caller's

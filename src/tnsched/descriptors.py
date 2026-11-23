@@ -1,52 +1,37 @@
-"""Structural descriptors of a network, the x-axis of every plot (docs/descriptors.md).
+"""Structural descriptors of a network: numbers and flags read off its graph. docs/descriptors.md.
 
-A descriptor is a number or a flag read off the graph of the network. They make "which optimizer
-wins" a statement about a class rather than about a list of files. Every number is measured on ONE
-component of H = inst.core (the network simplified and closed), through one of its views (the word "index" is a
-bond or a hyperedge; "tensor" a vertex 0..n-1; an open leg is not part of the class and is reported apart):
-  H            bonds are edges, a hyperedge (or an open index on >= 2 tensors) is a vertex. It is the
-               incidence graph with the bond vertices smoothed out: same treewidth, planarity and genus,
-               fewer vertices. The graph of the tw, topology and curvature rows.
-  incidence    I: tensors and indices as vertices, an edge between a tensor and each of its indices (for a
-               hypergraph its Levi graph; with bonds only, H with every edge subdivided): the graph for
-               counting steps. A distance, a girth or a walk between tensors is half of its own.
-  index graph  L: one vertex per index, an edge when two indices sit on a common tensor (with bonds only, the
-               line graph of H): tw_w(L) = T*, the log2 cost of the largest step of the best contraction
-               tree [MS08].
-  cut          never a graph: cut_bits(S) = sum of w_e = log2 d_e over the indices with tensors on both
-               sides of S, each ONCE (the cut-net metric). W and b are defined by it. One tensor
-               graph stands in for it and for nothing else: `cut_graph` (clique weight
-               w_e / (floor(r/2) ceil(r/2)): its cut is <= cut_bits(S), so a spectral LOWER bound on it is
-               one on W; halve() also searches it, and measures what it finds with cut_bits()).
-The primal graph (a hyperedge = a clique, unweighted) is used nowhere: one index on n tensors has
-treewidth n - 1 there and costs one index.
+They make "which optimizer wins" a statement about a class of networks, not about a list of files. Every descriptor
+is measured on ONE connected component of H = inst.core (the network simplified, without open legs). Words: a tensor
+is a vertex 0..n-1; an index is a bond or a hyperedge; w_e = log2 d_e is its weight in bits. Four views of a
+component:
+  H            bonds are edges, a hyperedge is a vertex ("index", e). The graph of the treewidth, topology and
+               curvature rows.
+  incidence    tensors and indices as vertices, an edge between a tensor and each of its indices (with bonds only, H
+               with every edge subdivided). The graph for counting steps: a distance between tensors is half its own.
+  index graph  one vertex per index, an edge when two indices share a tensor (with bonds only, the line graph of H).
+               Its weighted treewidth is T*, the log2 cost of the largest step of the best contraction tree [MS08].
+  cut graph    tensors only, every index of r tensors a clique on them (the primal graph), weighted
+               w_e / (floor(r/2) ceil(r/2)) per pair; with bonds only, H. The graph of the cut rows.
+The cut of a set S of tensors, cut_bits(S), is the sum of w_e over the indices with tensors on both sides of S, each
+once: it defines W (log2 of the largest intermediate) and b (the balanced cut). No cut of the cut graph exceeds it
+(cut_graph says why), so the cut graph gives lower bounds on W and is where halve() searches.
 
-The module reads top to bottom: 1. ConnectedComponent (one component of inst.core), the three primitives
-(tensor_distances, cut_bits, walk) and the spectrum (gap); 2. one function per descriptor,
-f(component) -> number | bool | None (None = not defined, never inf or nan: rows go to JSON),
-grouped as in docs/descriptors.md; 3. the table DESCRIPTORS and table(); 4. measure(component), save and load. The docstring of
-a probe is one line: what the number is, then its docs/descriptors.md section and source keys (the graph and the source are the
-columns On and Source of DESCRIPTORS). kind is "exact", "upper", "lower" or "estimate"; bounds says
-WHICH quantity: "W" (space: log2 of the largest intermediate, bits), "T" (time: the largest step,
-bits), "tw" (treewidth of the incidence graph = of H), "b" (balanced cut, bits), "alpha" (separator
-exponent), "D" (a dimension), "-" (a plain property). fast = False means seconds or more; complexity says how the cost grows (its letters: the comment above
-DESCRIPTORS). Above max_size a probe is not run: the value is None and the name goes to the row's
-"skipped" list (caps: the comment above DESCRIPTORS; counted in tensors, in indices for the index graph, in pairs of
-tensors for the cut graph, in edges of H for the curvature).
+Reading order:
+1. ConnectedComponent and its views, split(), the three primitives (tensor_distances, cut_bits, walk), the spectrum;
+2. one function per descriptor, f(component) -> number | bool | None, grouped as in docs/descriptors.md. None means
+   not defined, never inf or nan: rows go to JSON. The docstring is one line: what the number is, its docs section
+   and source keys;
+3. the table DESCRIPTORS (its columns are explained above it) and table();
+4. measure(component), save, load.
 
 Left out: exact carving width of planar networks (ratcatcher), hyperbolicity, modularity, Ollivier curvature (an
 optimal transport per edge).
-Dimension rows, three for the balls and three for the walk: a flag says whether the growth is
-exponential; then a dimension D if it is a power law (lattices), a rate if it is exponential
-(expanders; also regular trees and hyperbolic graphs, whose separators are small all the same), the
-other value None.
 """
 from __future__ import annotations
 
 import hashlib
 import heapq
 import itertools
-import json
 import math
 import time
 from collections.abc import Callable
@@ -63,24 +48,21 @@ from scipy.optimize import minimize_scalar
 from . import config
 from .instances import graph_to_tn, network_id
 
-# The spectral term of tw_lower needs lambda_2 of H: a dense eigendecomposition up to 300 vertices, then an
-# iterative solver whose time depends on the graph. A random 4-regular graph is the slow case: 1.4 s at 3 000
-# tensors, 2.8 s at 4 096, 11 s at 6 000 (lattices and small worlds take a fraction of that)
+# lambda_2 of H (the spectral term of tw_lower): dense up to 300 vertices, then an iterative solver. A random
+# 4-regular graph is the slow case: 1.4 s at 3 000 tensors, 2.8 s at 4 096, 11 s at 6 000
 SPECTRAL_MAX_N = 4096
-# the rows on the cut graph: lambda_2_cut and b_lower take 0.3 s at 32 000 pairs of tensors, b_upper (halve)
-# about 4e-5 s per pair and 2 s at the largest 50 000-pair networks; below MAX_CUT_GRAPH_PAIRS // 2 it stays
-# near 2 s even where the graph has many tensors (5 s at 32 418 pairs and 17 000 tensors)
-MAX_CUT_GRAPH_PAIRS = 50_000
-# the dimension rows: fewer points in the window cannot tell a power law from an exponential. They
-# differ because the windows do: a ball has at most ecc/2 radii by nature, a walk has up to MAX_WALK_STEPS steps
-MIN_BALL_POINTS = 4              # the ball rows: radii 1 .. ecc/2
-MIN_WALK_POINTS = 6              # the walk rows: steps 4 .. the last with p >= MIX_FACTOR pi
-# p_k - pi is fitted on a log scale: near the limit pi the difference is tiny and noisy, so stop while
-# it is still >= 3 pi (p >= 4 pi)
+# the rows on the cut graph: lambda_2_cut and b_lower take 0.3 s at 32 000 pairs of tensors; b_upper (halve) about
+# 4e-5 s per pair, 2 s at 50 000 pairs (5 s at 32 418 pairs and 17 000 tensors)
+CUT_GRAPH_MAX_PAIRS = 50_000
+# the dimension rows: with fewer points a power law and an exponential cannot be told apart. A ball has at most
+# ecc/2 radii by nature, a walk up to WALK_MAX_STEPS steps, hence two numbers
+BALL_MIN_POINTS = 4              # the ball rows: radii 1 .. ecc/2
+WALK_MIN_POINTS = 6              # the walk rows: steps 4 .. the last with p >= MIX_FACTOR pi
+# p_k - pi is fitted on a log scale, where a tiny difference is noise: stop while it is still >= 3 pi (p >= 4 pi)
 MIX_FACTOR = 4
-MAX_WALK_STEPS = 4096            # an expander stops after a few steps; a ring or a large lattice never mixes in range
-# the separator exponent of b(m) = a + scale m^alpha: a separator grows at most like m, so alpha is searched in ALPHA_BOUNDS;
-# within BOUND_TOL of a bound the minimum is the edge of the search, not a stationary point, so no error bar is given
+WALK_MAX_STEPS = 4096            # an expander stops after a few steps; a ring or a large lattice never mixes in range
+# the separator exponent alpha of b(m) = a + scale m^alpha is searched in ALPHA_BOUNDS (a separator grows at most
+# like m). Within BOUND_TOL of a bound the minimum is the edge of the search, not a stationary point: no error bar
 ALPHA_BOUNDS = (0.01, 1)
 BOUND_TOL = 1e-3
 
@@ -94,20 +76,15 @@ def _is_index(v: Any) -> bool:
 
 
 # === 1. the component, the three primitives, the spectrum ===============================
-#
-# inst.core (instances.py) is the graph H of the whole network: tensors 0..n-1, a bond a
-# tensor-tensor edge with weight w = log2 d, a hyperedge (or an open index on >= 2 tensors) a vertex
-# ("index", e) joined to its tensors, every edge of weight log2 d. A ConnectedComponent is one connected
-# piece of it plus the seed; the incidence graph, the index graph and the cut graph are views of H,
-# built on first use.
 
 @dataclass(frozen=True, eq=False)
 class ConnectedComponent:
-    """A connected component H of inst.core and its views: H itself, the incidence graph I, the index graph L and
-    the cut graph (module docstring). `seed` feeds every random choice of a probe, so measure() is deterministic.
-    Views are built once and kept."""
+    """One connected component H of inst.core, with its views (module docstring) built on first use. `seed` feeds
+    every random choice of a probe, so measure() is deterministic."""
     H: nx.Graph
     seed: int = 0
+    # results keyed by arguments: the spectra of gap(), by graph and weighting
+    _cache: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # every descriptor and every view assumes this, so it is checked where the object is built
@@ -119,13 +96,7 @@ class ConnectedComponent:
         if any(w <= 0 for _, _, w in self.H.edges(data="weight", default=1.0)):
             raise ValueError(f"every weight (log2 d) must be > 0; {hint}")
 
-    # _cache = intermediate results of a MEASUREMENT, shared by several rows or keyed by arguments: the
-    # spectra of gap() (by graph and weighting)
-    _cache: dict = field(default_factory=dict, init=False, repr=False)
-
-    # cached_property = what the network IS, no arguments: the tensors, the views (incidence_graph,
-    # index_graph, cut_graph, incidence_matrix) and structural facts (degrees, ranks, id,
-    # incidence_girth, the Forman list per edge)
+    # cached_property: what the component IS, computed once: the tensors, the views, structural facts
     @cached_property
     def tensors(self) -> tuple[int, ...]:
         return tuple(sorted(v for v in self.H if not _is_index(v)))
@@ -141,9 +112,8 @@ class ConnectedComponent:
 
     @cached_property
     def incidence_graph(self) -> nx.Graph:
-        """The incidence graph I: tensors and indices as vertices, an edge between a tensor and each of its indices
-        (for a hypergraph its Levi graph; with bonds only, H with every bond turned into an index vertex ("bond", a, b)).
-        An edge carries the weight w of its index. The nodes are the tensors, then the indices in the order of H's edges."""
+        """The incidence graph: the tensors, then the indices in the order of H's edges; every edge carries the w of
+        its index. A bond a-b becomes the index vertex ("bond", a, b)."""
         G = nx.Graph()
         G.add_nodes_from(self.tensors)
         for u, v, w in self.H.edges(data="weight", default=1.0):
@@ -155,9 +125,10 @@ class ConnectedComponent:
 
     @cached_property
     def incidence_matrix(self) -> sparse.csr_array:
-        """B[t, e] = 1 when index e is on tensor t (weight=None: incidences, not bits); rows in the order
-        of self.tensors, columns in the order of self.indices."""
-        return sparse.csr_array(nx.bipartite.biadjacency_matrix(self.incidence_graph, self.tensors, self.indices, weight=None))
+        """B (T, I), B[t, e] = 1 when index e is on tensor t; rows in the order of self.tensors, columns of
+        self.indices (weight=None: incidences, not bits)."""
+        B = nx.bipartite.biadjacency_matrix(self.incidence_graph, self.tensors, self.indices, weight=None)
+        return sparse.csr_array(B)
 
     @cached_property
     def indices(self) -> tuple:
@@ -172,8 +143,7 @@ class ConnectedComponent:
 
     @cached_property
     def index_graph(self) -> nx.Graph:
-        """The index graph L: one vertex per index, an edge when two indices sit on a common tensor (with bonds only,
-        the line graph of H): the incidence graph projected on its index vertices (nodes in the order of self.indices)."""
+        """The index graph: the incidence graph projected on its indices (nodes in the order of self.indices)."""
         return nx.bipartite.projected_graph(self.incidence_graph, self.indices)
 
     @cached_property
@@ -184,11 +154,11 @@ class ConnectedComponent:
 
     @cached_property
     def forman_per_edge(self) -> list[float]:
-        """F(e) = 4 - deg(u) - deg(v) + 3 * (triangles through e) for every edge u-v of H: the per-edge
-        curvature that forman_mean and forman_min both summarise."""
+        """F(e) = 4 - deg(u) - deg(v) + 3 (triangles through e) for every edge u-v of H, the Forman curvature that
+        forman_mean and forman_min summarise."""
         H = self.H
-        # the triangles through u-v are the neighbours of one end that are neighbours of the other: walk the end of
-        # smaller degree, so an edge costs its smaller degree whatever order the nodes are in (a hub costs nothing)
+        # triangles through u-v: the neighbours of one end that also neighbour the other. Walking the end of smaller
+        # degree makes an edge cost its smaller degree (an edge at a hub stays cheap)
         values = []
         for u, v in H.edges:
             small, large = (u, v) if H.degree(u) <= H.degree(v) else (v, u)
@@ -202,27 +172,26 @@ class ConnectedComponent:
 
     @cached_property
     def id(self) -> str:
-        """The id of the network this component is: H turned back into a network by graph_to_tn
-        (a hyperedge vertex is one index, a weight w is a dimension 2**w), then instances.network_id of it. For
-        a connected, closed network of bonds only (no trace, no parallel bond, no hyperedge) it is the instance's."""
+        """network_id of H turned back into a network (graph_to_tn: a weight w is a dimension 2**w). For a connected,
+        closed network of single bonds only it is the instance's id."""
         return network_id(*graph_to_tn(self.H))
 
     @cached_property
     def cut_graph(self) -> nx.Graph:
-        """The cut graph: tensors only, every index of r tensors a clique of weight w_e / (floor(r/2) ceil(r/2)) per
-        pair, the weighted clique expansion.
-        A split k | r - k cuts k (r - k) <= floor(r/2) ceil(r/2) pairs, so the clique adds at most w_e,
-        the index's own share of cut_bits(S): its cut is <= cut_bits(S) for every S, so a spectral LOWER bound on
-        it is one on W. halve() searches the same graph and measures what it finds with the true cut_bits().
-        Bonds only: the cut graph IS H (r = 2 gives the weight w_e). An index of r tensors has r (r - 1) / 2
-        pairs: measure() skips the rows on this graph above MAX_CUT_GRAPH_PAIRS."""
+        """The cut graph: the primal graph (tensors only, every index of r tensors a clique on them) with weight
+        w_e / (floor(r/2) ceil(r/2)) per pair; with bonds only, H itself.
+
+        A split k | r - k cuts k (r - k) <= floor(r/2) ceil(r/2) pairs, so the clique adds at most w_e, the index's
+        share of cut_bits(S): the cut of this graph never exceeds cut_bits(S). An index of r tensors has r (r - 1) / 2
+        pairs: measure() skips the rows on this graph above CUT_GRAPH_MAX_PAIRS."""
         if not any(map(_is_index, self.H)):              # bonds only: H already is the cut graph
             return self.H.copy()
         G = nx.Graph()
         G.add_nodes_from(self.tensors)
         for k in self.indices:
             r = self.ranks[k]
-            for a, b in itertools.combinations(sorted(self.incidence_graph[k]), 2):   # sorted: the edges go in in a fixed order
+            # sorted: the edges go in in a fixed order
+            for a, b in itertools.combinations(sorted(self.incidence_graph[k]), 2):
                 # two indices on the same pair of tensors: their weights add
                 old = G[a][b]["weight"] if G.has_edge(a, b) else 0.0
                 G.add_edge(a, b, weight=old + self.w[k] / ((r // 2) * (r - r // 2)))
@@ -230,7 +199,8 @@ class ConnectedComponent:
 
 
 def split(H: nx.Graph, seed: int, tensors: Any = None) -> list[ConnectedComponent]:
-    """The connected pieces of H, or of these tensors of H, largest first (ties: smallest tensor). docs/descriptors.md."""
+    """The connected pieces of H, or of these tensors of H, largest first (ties: smallest tensor).
+    docs/descriptors.md."""
     if tensors is not None:
         keep = set(tensors)
         # a bond stays when both its tensors do (subgraph); a hyperedge vertex with one tensor joins nothing
@@ -243,17 +213,16 @@ def split(H: nx.Graph, seed: int, tensors: Any = None) -> list[ConnectedComponen
 # --- the three primitives: tensor_distances, cut_bits, walk -----------------------------
 
 def tensor_distances(c: ConnectedComponent, s: int) -> dict[int, int]:
-    """On: the incidence graph. Is: the number of indices crossed from s to every tensor (a bond 1, a
-    hyperedge 1 whatever its rank). By: BFS, half its distance. docs/descriptors.md, views of a component."""
+    """tensor -> the number of indices crossed from s (a hyperedge counts 1, whatever its rank): half the BFS
+    distance on the incidence graph. docs/descriptors.md, views of a component."""
     d = nx.single_source_shortest_path_length(c.incidence_graph, s)
     # tensor -> index -> tensor is 2 edges, for a bond and a hyperedge alike
     return {t: k // 2 for t, k in d.items() if not _is_index(t)}
 
 
 def cut_bits(c: ConnectedComponent, A: Any) -> float:
-    """w(dA) in bits: log2 of the size of the intermediate made by contracting A (docs/descriptors.md, views of a component).
-    On: the cut (no graph). Is: sum of w_e = log2 d_e over the indices that have tensors in A and
-    outside A, each once. By: the edges of H, a hyperedge at its first edge."""
+    """w(dA) in bits, log2 of the entries of the intermediate that contracts the tensors A: the sum of w_e over the
+    indices with tensors in A and outside it, each once. docs/descriptors.md, views of a component."""
     A, done, total = set(A), set(), 0.0
     for u, v, w in c.H.edges(data="weight", default=1.0):       # every edge of a hyperedge carries its w_e
         if _is_index(u) or _is_index(v):
@@ -271,12 +240,14 @@ def cut_bits(c: ConnectedComponent, A: Any) -> float:
 
 
 def walk(c: ConnectedComponent) -> sparse.csr_array:
-    """On: incidence seen every two steps. Is: P = D_T^-1 B D_I^-1 B^T on the tensors (rows in
-    c.tensors order): from t pick one of its indices uniformly, then one tensor of that index
-    uniformly. By: [ZHS06]; on bonds only it is the lazy walk (1 + D^-1 A) / 2. docs/descriptors.md, estimates."""
-    B = c.incidence_matrix
-    # d_T: the indices on each tensor; d_I: the tensors of each index
+    """P (T, T) = D_T^-1 B D_I^-1 B^T, the random walk on the tensors: from t one of its indices uniformly, then one
+    tensor of that index uniformly [ZHS06]. With bonds only, the lazy walk (1 + D^-1 A) / 2.
+    docs/descriptors.md, estimates."""
+    B = c.incidence_matrix                                     # (T, I), B[t, e] = 1 if index e is on tensor t
+    # d_T: the indices on each tensor (its degree); d_I: the tensors of each index (its rank)
     d_T, d_I = np.asarray(B.sum(axis=1)).ravel(), np.asarray(B.sum(axis=0)).ravel()
+    # D_T^-1 B (T, I): tensor -> each of its indices with probability 1/d_T; D_I^-1 B^T (I, T): index -> each of its
+    # tensors with probability 1/d_I. The product P[t, u] = Prob(t -> u in two steps); rows sum to 1
     return (sparse.diags(1.0 / d_T) @ B @ sparse.diags(1.0 / d_I) @ B.T).tocsr()
 
 
@@ -309,14 +280,11 @@ def gap(c: ConnectedComponent, which: str, weight: str | None) -> tuple[float, n
 
 
 # === 2. the descriptors, in the order of docs/descriptors.md =====================================
-#
-# Every descriptor receives one connected component; measure() is the entry point, and
-# split() is the only constructor.
 
 # --- size ---
 
 def size(c: ConnectedComponent) -> tuple[int, int, int, Value, Value]:
-    """(n_tensors, n_indices, n_incidences, mean_log2_d, std_log2_d): how big the component is. docs/descriptors.md, size."""
+    """(n_tensors, n_indices, n_incidences, log2_d_mean, log2_d_std): how big the component is. docs/descriptors.md, size."""
     bits = list(c.w.values())                          # w_e = log2 d_e of every index, in bits
     # an index is a bond or a hyperedge; the incidences (sum of r_e) are the edges of the incidence graph
     return (c.n, len(c.indices), c.incidence_graph.number_of_edges(),
@@ -325,12 +293,12 @@ def size(c: ConnectedComponent) -> tuple[int, int, int, Value, Value]:
 
 # --- degree ---
 
-def mean_degree(c: ConnectedComponent) -> Value:
+def degree_mean(c: ConnectedComponent) -> Value:
     """The mean number of indices on a tensor. docs/descriptors.md, degree."""
     return float(np.mean(c.degrees))
 
 
-def max_degree(c: ConnectedComponent) -> int:
+def degree_max(c: ConnectedComponent) -> int:
     """The largest number of indices on a tensor: the Delta of the bound tw -> T. docs/descriptors.md, degree."""
     return max(c.degrees)
 
@@ -345,7 +313,7 @@ def hyperedge_fraction(c: ConnectedComponent) -> float:
     return n_hyperedges(c) / len(c.indices) if c.indices else 0.0
 
 
-def max_hyperedge_size(c: ConnectedComponent) -> int:
+def hyperedge_size_max(c: ConnectedComponent) -> int:
     """The largest r_e: 2 on a network of bonds, 0 without an index. docs/descriptors.md, degree."""
     return max(c.ranks.values(), default=0)
 
@@ -381,12 +349,10 @@ def girth(c: ConnectedComponent) -> Value:
 
 
 # --- dimension ---
-# two growths, each read as a law and a value: the balls |B(r)| and the return p_k - pi of the walk.
-# A power law (a lattice) has a dimension D; an exponential (an expander, a regular tree, a hyperbolic
-# graph) has a rate and no dimension. Both laws are fitted on the same window and the smaller residual
-# wins (a tie: power). The balls vote, one fit per source; the walk is one fit on the source average.
-# Each fit is one function that returns all its rows (a group of DESCRIPTORS): the flag, then the
-# value of the power law, then the value of the exponential, the other one None.
+# Two growths: the balls |B(r)| and the return p_k - pi of the walk. A power law (a lattice) has a dimension D; an
+# exponential (an expander, a regular tree, a hyperbolic graph) has a rate. Both laws are fitted on the same window,
+# the smaller residual wins (a tie: power). The balls vote, one fit per source; the walk is one fit on the average.
+# Each fit returns its three rows: the flag "exponential", the power law's D, the exponential's rate (one is None).
 
 def _fit_both(x: np.ndarray, y: np.ndarray, min_points: int) -> tuple[str | None, float | None]:
     """(regime, slope): ("power", slope of y on log x) or ("exponential", slope of y on x), whichever
@@ -402,7 +368,7 @@ def _fit_both(x: np.ndarray, y: np.ndarray, min_points: int) -> tuple[str | None
     return "power", float(power[0])
 
 
-def balls(c: ConnectedComponent) -> tuple[Value, Value, Value]:
+def ball_fit(c: ConnectedComponent) -> tuple[Value, Value, Value]:
     """(ball_exponential, ball_dimension, ball_growth_rate): the growth of the balls of tensors. docs/descriptors.md, dimension."""
     # the law of log |B(r)| per source (<= 8; r = 1 .. ecc/2), the majority of the sources with a window
     # (a tie: power), and the mean slope of that law: D (power) or c (exponential); all None without a window
@@ -413,7 +379,7 @@ def balls(c: ConnectedComponent) -> tuple[Value, Value, Value]:
         rmax = max(dist.values()) // 2                 # half the eccentricity: farther, the ball feels the edge
         cumulative = np.cumsum(np.bincount(list(dist.values())))  # cumulative[r] = |B(r)|, within r indices
         r = np.arange(1, rmax + 1, dtype=float)
-        regime, slope = _fit_both(r, np.log(cumulative[1:rmax + 1]), MIN_BALL_POINTS)
+        regime, slope = _fit_both(r, np.log(cumulative[1:rmax + 1]), BALL_MIN_POINTS)
         if regime is not None:                         # a short window does not vote
             slopes[regime].append(slope)
     power, exponential = slopes["power"], slopes["exponential"]
@@ -426,11 +392,10 @@ def balls(c: ConnectedComponent) -> tuple[Value, Value, Value]:
     return True, None, value
 
 
-def _return_probability(c: ConnectedComponent) -> tuple[np.ndarray, float]:
-    """(p, pi) of the walk of the tensors (walk()): p[k - 1] = the probability that a walker is back at
-    its start after k steps, averaged over <= 32 starts; pi = the limit of p, the stationary
-    probability of those starts. The walk stops at the first step with p < MIX_FACTOR pi (the fit has
-    nothing more to use) or after MAX_WALK_STEPS. Needs 2 tensors."""
+def _return_probability_mean(c: ConnectedComponent) -> tuple[np.ndarray, float]:
+    """(p, pi): p[k - 1] the probability that a walker is back at its start after k steps (walk()), averaged over
+    <= 32 starts; pi its limit, the stationary probability of those starts. Stops at the first p < MIX_FACTOR pi or
+    after WALK_MAX_STEPS. Needs 2 tensors."""
     n = c.n
     P = walk(c)                                        # P[t, s]: probability of the step t -> s
     PT = P.T.tocsr()                                   # P^T: one product moves every walker one step
@@ -442,7 +407,7 @@ def _return_probability(c: ConnectedComponent) -> tuple[np.ndarray, float]:
     X[sources, columns] = 1.0                          # walker j starts on sources[j] with certainty
     pi = degree[sources].mean() / degree.sum()         # where p ends: the stationary probability
     p = []
-    for _ in range(MAX_WALK_STEPS):
+    for _ in range(WALK_MAX_STEPS):
         X = PT @ X                                     # every walker takes one step
         p.append(X[sources, columns].mean())           # back at its own start, averaged
         if p[-1] < MIX_FACTOR * pi:                    # mixed: the rest is noise on a log scale
@@ -451,15 +416,16 @@ def _return_probability(c: ConnectedComponent) -> tuple[np.ndarray, float]:
 
 
 def walk_fit(c: ConnectedComponent) -> tuple[Value, Value, Value]:
-    """(walk_exponential, spectral_dimension, walk_decay_rate): the return probability of the walk. docs/descriptors.md, dimension [ZHS06]."""
+    """(walk_exponential, walk_dimension, walk_decay_rate): the return probability of the walk. docs/descriptors.md, dimension [ZHS06]."""
     # the law of p_k - pi on the window k >= 4 with p_k >= MIX_FACTOR pi: d_s = -2 x the slope on log k
-    # (power) or gamma = -the slope on k (exponential); all None with fewer than MIN_WALK_POINTS steps
+    # (power) or gamma = -the slope on k (exponential); all None with fewer than WALK_MIN_POINTS steps
     if c.n < 2:
         return None, None, None                        # no step to take
-    p, pi = _return_probability(c)
+    p, pi = _return_probability_mean(c)
     k = np.arange(1, len(p) + 1, dtype=float)          # the step numbers of p
     keep = (k >= 4) & (p >= MIX_FACTOR * pi)           # past the first steps (lattice detail), not yet mixed
-    regime, slope = _fit_both(k[keep], np.log(p[keep] - pi), MIN_WALK_POINTS)   # a power law in k, or an exponential decay: a gap
+    # a power law in k, or an exponential decay: a gap
+    regime, slope = _fit_both(k[keep], np.log(p[keep] - pi), WALK_MIN_POINTS)
     if regime == "power":
         return False, float(-2 * slope), None          # p_k - pi ~ k^(-D/2), so D = -2 x slope
     if regime == "exponential":
@@ -468,11 +434,10 @@ def walk_fit(c: ConnectedComponent) -> tuple[Value, Value, Value]:
 
 
 # --- treewidth and weighted treewidth: two brackets, four rows ---------------------------
-# tw(H) is the treewidth of the incidence graph (docs/descriptors.md), unweighted:   tw_lower <= tw(H) <= tw_upper
-# tw_w(L(N)) is the weighted treewidth of the index graph L, in bits: T*, the largest step of the best
-# tree [MS08]:                                                                  tw_w_lower <= T* <= tw_w_upper
-# A lower bound row is the max of its methods, each a valid bound; the methods are private, one
-# function each, with its reason above it.
+# tw(H), unweighted (the same as the incidence graph's):                          tw_lower <= tw(H) <= tw_upper
+# T* = tw_w(L), the weighted treewidth of the index graph L in bits: the largest step of the best tree [MS08]:
+#                                                                                 tw_w_lower <= T* <= tw_w_upper
+# A lower row is the max of its methods, each a valid bound, with the reason above it.
 
 # every subgraph of a graph of treewidth k has a vertex of degree <= k: the largest min degree
 def _degeneracy(G: nx.Graph) -> int:
@@ -489,16 +454,16 @@ def _order(v: Any) -> tuple:
 # the same for every minor; minor-min-width, a heuristic value of the contraction degeneracy [BKW06]
 def _mmd(G: nx.Graph) -> int:
     """Minor-min-width of G, least-common-neighbour rule: a lower bound on tw(G)."""
-    adj = {v: set(G[v]) for v in G}                                # the current minor of G: G with the contractions done so far
+    adj = {v: set(G[v]) for v in G}             # the current minor of G: G with the contractions done so far
     heap = [(len(adj[v]), _order(v), v) for v in adj]              # smallest degree first, ties by _order
     heapq.heapify(heap)
     best = 0
     while len(adj) > 1:
         degree, _, v = heapq.heappop(heap)
+        # a stale entry: the heap cannot update or remove an entry, so a vertex whose degree changed gets a new one
+        # and a removed vertex keeps its old ones; an entry is used only if it still describes adj
         if v not in adj or len(adj[v]) != degree:
-            continue                                               # a stale entry: the heap cannot update or remove an entry, so a vertex
-                                                                   # whose degree changed gets a new one and a removed vertex keeps its old
-                                                                   # ones; an entry is used only if it still describes adj
+            continue
         best = max(best, degree)                                   # the min degree of every minor bounds tw
         neighbours = adj.pop(v)
         if neighbours:                                             # an isolated vertex is only deleted
@@ -517,7 +482,7 @@ def _mmd(G: nx.Graph) -> int:
 
 # ceil(n lambda_2 / (Delta + lambda_2) - 1), n, Delta, lambda_2 of H, any graph with an edge [GHN24]
 def _spectral_tw(c: ConnectedComponent) -> int:
-    """The spectral lower bound on tw(H); 0 (a valid lower bound) on a single vertex or above SPECTRAL_MAX_N tensors."""
+    """The spectral lower bound on tw(H); 0 (still valid) on one vertex or above SPECTRAL_MAX_N tensors."""
     if len(c.H) < 2 or c.n > SPECTRAL_MAX_N:
         return 0
     lam = gap(c, "H", None)[0]                                     # lambda_2 of H, every edge 1
@@ -527,7 +492,7 @@ def _spectral_tw(c: ConnectedComponent) -> int:
 
 
 def tw_lower(c: ConnectedComponent) -> int:
-    """The max of valid lower bounds on tw(H): degeneracy, minor-min-width, spectral up to SPECTRAL_MAX_N. docs/descriptors.md, treewidth [BKW06, GHN24]."""
+    """The max of three lower bounds on tw(H): degeneracy, minor-min-width, spectral. docs/descriptors.md, treewidth [BKW06, GHN24]."""
     return max(_degeneracy(c.H), _mmd(c.H), _spectral_tw(c))
 
 
@@ -538,7 +503,7 @@ def tw_upper(c: ConnectedComponent) -> int:
 
 
 def tw_w_lower(c: ConnectedComponent) -> float:
-    """tw_w(L(N)) = T*, lower bound in bits: the best of a tensor, a bag of tw(L) + 1 indices, tw_lower. docs/descriptors.md, weighted treewidth [BKW06, GHN24]."""
+    """A lower bound on T* in bits: the max of the heaviest tensor, a bag of tw(L) + 1 indices, w_min tw_lower. docs/descriptors.md, weighted treewidth [BKW06, GHN24]."""
     if not c.indices:
         return 0.0
     w_min = min(c.w.values())
@@ -552,7 +517,7 @@ def tw_w_lower(c: ConnectedComponent) -> float:
 
 
 def tw_w_upper(c: ConnectedComponent) -> float:
-    """tw_w(L(N)) = T*, upper bound in bits: the largest min-fill bag of the index graph; bounds W too. docs/descriptors.md, weighted treewidth [MS08]."""
+    """An upper bound on T* (and on W) in bits: the heaviest bag of the min-fill order of the index graph. docs/descriptors.md, weighted treewidth [MS08]."""
     if not c.indices:
         return 0.0
     # an elimination order of the index graph IS a contraction order (summing an index = contracting its
@@ -575,16 +540,15 @@ def lambda_2_cut(c: ConnectedComponent) -> Value:
 
 
 def b_lower(c: ConnectedComponent) -> Value:
-    """2 lambda_2_cut n / 9 bits, from cut(S) >= lambda_2 |S| (n - |S|) / n: a lower bound on every balanced cut (n/3 <= |S| <= 2n/3), so on b and on W. docs/descriptors.md, width [Moh92]."""
+    """2 lambda_2_cut n / 9 bits: a lower bound on every balanced cut (n/3 <= |S| <= 2n/3), so on b and on W, since cut(S) >= lambda_2 |S| (n - |S|) / n. docs/descriptors.md, width [Moh92]."""
     lam = lambda_2_cut(c)
     return None if lam is None else 2 * lam * c.n / 9
 
 
 def halve(c: ConnectedComponent, starts: int = 5, seed: int | None = None) -> tuple[float, set, set]:
-    """(cut in bits, A, B): split the tensors of the cut graph in halves (its weighted Fiedler vector,
-    the one of lambda_2_cut, cut at its median, and `starts` random halves, each refined by
-    Kernighan-Lin) and measure the best in the true cut, so the value is a valid upper bound. Needs 2
-    tensors; halves count tensors."""
+    """(cut in bits, A, B): the best of 1 + `starts` halvings of the tensors, measured by cut_bits, so an upper
+    bound. The starts are the Fiedler vector of the cut graph cut at its median and `starts` random halves, each
+    refined by Kernighan-Lin on the cut graph. Needs 2 tensors."""
     rng = np.random.default_rng(c.seed if seed is None else seed)
     G = c.cut_graph
     nodes = list(G)
@@ -613,8 +577,8 @@ def b_upper(c: ConnectedComponent) -> Value:
 
 
 def bisection_profile(c: ConnectedComponent, min_size: int = 4) -> tuple[list[int], list[float]]:
-    """Recursive halving: the size m (tensors) and the cut b(m) of every piece cut, pieces of at least
-    2 * min_size tensors; a half that falls apart is cut along its connected pieces (cut 0, so no point of b(m))."""
+    """(sizes, cuts): recursive halving, the size m (tensors) and cut b(m) of every piece of >= 2 min_size tensors.
+    A half that falls apart goes on as its connected pieces (a cut of 0 between them: no point of b(m))."""
     sizes: list[int] = []
     cuts: list[float] = []
     stack = [c]                                                    # the pieces still to cut
@@ -631,7 +595,7 @@ def bisection_profile(c: ConnectedComponent, min_size: int = 4) -> tuple[list[in
 
 
 def alpha(c: ConnectedComponent) -> tuple[Value, Value]:
-    """(alpha_bisection, alpha_bisection_err): the exponent of b(m) = a + scale m^alpha on bisection_profile and its error. docs/descriptors.md, separator exponent."""
+    """(alpha_bisection, alpha_bisection_err): the exponent of b(m) = a + scale m^alpha fitted on bisection_profile, and its error. docs/descriptors.md, separator exponent."""
     sizes, cuts = bisection_profile(c)
     if len(set(sizes)) < 3:
         return None, None                                          # a, c and alpha need 3 distinct sizes
@@ -643,10 +607,10 @@ def alpha(c: ConnectedComponent) -> tuple[Value, Value]:
         coef = np.linalg.lstsq(X, b, rcond=None)[0]
         return coef, float(np.sum((X @ coef - b) ** 2))
 
-    # linear in a, scale at fixed alpha: optimise alpha alone, then a, scale by least squares
+    # at a fixed alpha the model is linear in (a, scale): optimise alpha alone, (a, scale) by least squares inside
     alpha_hat = float(minimize_scalar(lambda x: fit(x)[1], bounds=ALPHA_BOUNDS, method="bounded").x)
     if len(m) < 4:
-        return alpha_hat, None                                     # three parameters fit three points exactly: no residual for an error
+        return alpha_hat, None                     # three parameters fit three points exactly: no residual for an error
     if min(alpha_hat - ALPHA_BOUNDS[0], ALPHA_BOUNDS[1] - alpha_hat) < BOUND_TOL:
         return alpha_hat, None                                     # at a bound the minimum is the edge of the search
     (a, scale), residual = fit(alpha_hat)
@@ -694,61 +658,60 @@ def forman_min(c: ConnectedComponent) -> Value:
 # === 3. the table =======================================================================
 
 class Probe(NamedTuple):
-    """One entry of DESCRIPTORS: `rows`, the names of the rows it fills (one for a single row, several for
-    a group filled by one function that returns a tuple aligned with them). `on`: "H" | "incidence" |
-    "index graph" | "cut" | "-"; `source`: the keys of the README References that define the row, or "-";
-    max_size counts `unit`, the size that predicts the cost of the row."""
+    """One entry of DESCRIPTORS: a function and the rows it fills (several when it returns a tuple)."""
     function: Callable[[ConnectedComponent], Value | tuple[Value, ...]]
-    kind: str                               # "exact" | "upper" | "lower" | "estimate"
-    bounds: str                             # which quantity: one of BOUNDS
-    on: str
-    source: str
+    kind: str                               # one of KINDS: the value is exact, a bound, or an estimate
+    bounds: str                             # one of BOUNDS: which quantity a bound or estimate is about
+    on: str                                 # one of ON: the view it is measured on
+    source: str                             # the keys of the README References that define it, or "-"
     fast: bool                              # False: seconds or more
-    max_size: int | None                    # above this the value is None and the names are "skipped"
-    unit: str                               # what max_size counts: "tensors" | "indices" | "pairs" | "tensors + pairs" | "edges" ("-": no cap)
+    max_size: int | None                    # above this the rows are None and listed as "skipped"
+    unit: str                               # what max_size counts: "tensors" | "indices" | "pairs" |
+                                            # "tensors + pairs" | "edges" ("-": no cap)
     complexity: str                         # how the cost grows with the size
     rows: tuple[str, ...]
 
 
-# the values allowed in the columns kind, bounds and on (the tests check every row)
+# the values allowed in the columns kind, bounds and on (the tests check every row). BOUNDS: W space (log2 of the
+# largest intermediate, bits), T time (log2 of the largest step, bits), tw treewidth of H, b balanced cut (bits),
+# alpha separator exponent, D a dimension, "-" a plain property
 KINDS = ("exact", "upper", "lower", "estimate")
 BOUNDS = ("W", "T", "tw", "b", "alpha", "D", "-")
 ON = ("H", "incidence", "index graph", "cut", "-")
 
-# One rule for every cap: a row runs where one call takes about 2 s at most (timed on the benchmark and the suite).
-# max_size is counted in the unit that predicts the cost of the row, as measured: the Forman rows in edges of H (each edge
-# counts the common neighbours of its two ends); the cut rows in pairs of tensors;
-# alpha_bisection, which halves every piece of every level, in tensors + pairs (the vertices and edges of the cut
-# graph): 2 s at about 3 500, where tensors alone (4 s at 905 tensors with 48 000 pairs) or pairs alone (4 s at 3 000
-# pairs and 2 000 tensors) mispredict it.
-# complexity: n, m = vertices and edges of H, Delta = the largest degree, I = indices (index graph),
-# r_e = the tensors of index e. On the cut graph m counts its pairs, r_e (r_e - 1) / 2 per index.
-# The views of a ConnectedComponent (built once, shared by the rows) are not counted.
-FORMAN_MAX_EDGES = 1_000_000              # 2.5 to 3 microseconds per edge in any node order: 2 s at the largest benchmark network (800,000 edges)
+# Caps: a row runs where one call takes about 2 s at most (timed on the benchmark and the suite). max_size counts
+# the unit that predicts the row's cost: edges of H for the Forman rows (each edge counts common neighbours), pairs
+# of tensors for the cut rows, tensors + pairs (the vertices and edges of the cut graph) for alpha_bisection, which
+# halves every piece of every level: 2 s at about 3 500, where tensors alone (4 s at 905 tensors with 48 000 pairs)
+# or pairs alone (4 s at 3 000 pairs, 2 000 tensors) mispredict it.
+# complexity: n, m = vertices and edges of H (on the cut graph m counts pairs, r_e (r_e - 1) / 2 per index),
+# Delta = the largest degree, I = indices, r_e = the tensors of index e. The views, built once, are not counted.
+# The Forman rows: 2.5 to 3 microseconds per edge, 2 s at the largest benchmark network (800 000 edges)
+FORMAN_MAX_EDGES = 1_000_000
 DESCRIPTORS = (
     #     function            kind        bounds on            source         fast   max_size, unit  complexity, rows
     Probe(size,               "exact",    "-",     "-",           "-",           True,  None, "-",
-          "O(m)", rows=("n_tensors", "n_indices", "n_incidences", "mean_log2_d", "std_log2_d")),
-    Probe(mean_degree,          "exact",    "-",   "-",          "-",            True,  None, "-",
-          "O(m)", rows=("mean_degree",)),
-    Probe(max_degree,           "exact",    "-",   "-",          "-",            True,  None, "-",
-          "O(m)", rows=("max_degree",)),
+          "O(m)", rows=("n_tensors", "n_indices", "n_incidences", "log2_d_mean", "log2_d_std")),
+    Probe(degree_mean,          "exact",    "-",   "-",          "-",            True,  None, "-",
+          "O(m)", rows=("degree_mean",)),
+    Probe(degree_max,           "exact",    "-",   "-",          "-",            True,  None, "-",
+          "O(m)", rows=("degree_max",)),
     Probe(n_hyperedges,         "exact",    "-",   "-",          "-",            True,  None, "-",
           "O(m)", rows=("n_hyperedges",)),
     Probe(hyperedge_fraction,   "exact",    "-",   "-",          "-",            True,  None, "-",
           "O(m)", rows=("hyperedge_fraction",)),
-    Probe(max_hyperedge_size,   "exact",    "-",   "-",          "-",            True,  None, "-",
-          "O(m)", rows=("max_hyperedge_size",)),
+    Probe(hyperedge_size_max,   "exact",    "-",   "-",          "-",            True,  None, "-",
+          "O(m)", rows=("hyperedge_size_max",)),
     Probe(diameter,             "exact",    "-",   "incidence",  "-",            False, 1_500, "tensors",
           "O(n m)", rows=("diameter",)),
     Probe(diameter_lower,       "lower",    "-",   "incidence",  "MLH09",        True,  None, "-",
           "O(m)", rows=("diameter_lower",)),
     Probe(girth,                "exact",    "-",   "incidence",  "-",            False, 1_000, "tensors",
           "O((n + m) m)", rows=("girth",)),
-    Probe(balls,                "estimate", "D",   "incidence",  "-",            True,  200_000, "tensors",
+    Probe(ball_fit,               "estimate", "D",   "incidence",  "-",            True,  200_000, "tensors",
           "O(m)", rows=("ball_exponential", "ball_dimension", "ball_growth_rate")),
     Probe(walk_fit,             "estimate", "D",   "incidence",  "ZHS06",        True,  10_000, "tensors",
-          "O(K s sum r_e^2), K <= MAX_WALK_STEPS, s <= 32", rows=("walk_exponential", "spectral_dimension", "walk_decay_rate")),
+          "O(K s sum r_e^2), K <= WALK_MAX_STEPS, s <= 32", rows=("walk_exponential", "walk_dimension", "walk_decay_rate")),
     Probe(tw_lower,             "lower",    "tw",  "H",          "BKW06, GHN24", True,  150_000, "tensors",
           "O(m log n) (degeneracy, minor-min-width) + the spectral term up to SPECTRAL_MAX_N", rows=("tw_lower",)),
     Probe(tw_upper,             "upper",    "tw",  "H",          "-",            False, 800, "tensors",
@@ -759,11 +722,11 @@ DESCRIPTORS = (
           "O(I^2 log I) to O(I^4) worst", rows=("tw_w_upper",)),
     Probe(lambda_2,             "exact",    "-",   "H",          "-",            True,  4_096, "tensors",
           "O(n^3) dense (n <= 300) / iterative", rows=("lambda_2",)),
-    Probe(lambda_2_cut,         "exact",    "-",   "cut",        "-",            True,  MAX_CUT_GRAPH_PAIRS, "pairs",
+    Probe(lambda_2_cut,         "exact",    "-",   "cut",        "-",            True,  CUT_GRAPH_MAX_PAIRS, "pairs",
           "O(n^3) dense (n <= 300) / iterative", rows=("lambda_2_cut",)),
-    Probe(b_lower,              "lower",    "b",   "cut",        "Moh92",        True,  MAX_CUT_GRAPH_PAIRS, "pairs",
+    Probe(b_lower,              "lower",    "b",   "cut",        "Moh92",        True,  CUT_GRAPH_MAX_PAIRS, "pairs",
           "O(n^3) dense (n <= 300) / iterative", rows=("b_lower",)),
-    Probe(b_upper,              "upper",    "b",   "cut",        "-",            False, MAX_CUT_GRAPH_PAIRS // 2, "pairs",
+    Probe(b_upper,              "upper",    "b",   "cut",        "-",            False, CUT_GRAPH_MAX_PAIRS // 2, "pairs",
           "6 starts x <= 10 KL passes of O(m log n), + the Fiedler vector of lambda_2_cut", rows=("b_upper",)),
     Probe(alpha,                "estimate", "alpha","cut",        "-",            False, 3_500, "tensors + pairs",
           "O(m log^2 n) (halve on every piece of every level) + their Fiedler vectors", rows=("alpha_bisection", "alpha_bisection_err")),
@@ -777,24 +740,26 @@ DESCRIPTORS = (
           "O(m Delta)", rows=("forman_min",)),
 )
 
-# the one index by row name: the names of the jsonl
+# row name (a key of the jsonl) -> its probe
 ROWS: dict[str, Probe] = {row: probe for probe in DESCRIPTORS for row in probe.rows}
 
 
 def table_id(slow: bool = True) -> str:
-    """The id of the probes that run, all of them or with slow=False the fast ones: their rows, caps and units. The
-    meta of a descriptors file records it, so a row, a group or a cap that changes, and a file made with only the
-    fast rows, are never read as the full table."""
-    return hashlib.sha256(repr([(p.rows, p.max_size, p.unit) for p in DESCRIPTORS if slow or p.fast]).encode()).hexdigest()[:16]
+    """A hash of the rows, caps and units of the probes that run (all, or the fast ones). A descriptors file's meta
+    records it, so a file made by another table, or with the fast rows only, is never read as this one."""
+    probes = [(p.rows, p.max_size, p.unit) for p in DESCRIPTORS if slow or p.fast]
+    return hashlib.sha256(repr(probes).encode()).hexdigest()[:16]
 
 
 def table() -> str:
     """DESCRIPTORS as a markdown table: the table of docs/descriptors.md is this output."""
     lines = ["| rows | kind | bounds | on | source | complexity | cost |", "|---|---|---|---|---|---|---|"]
     for probe in DESCRIPTORS:
-        cost = ("fast" if probe.fast else "slow") + ("" if probe.max_size is None else f", <= {probe.max_size:,} {probe.unit}")
+        cap = "" if probe.max_size is None else f", <= {probe.max_size:,} {probe.unit}"
+        cost = ("fast" if probe.fast else "slow") + cap
         rows = ", ".join(f"`{r}`" for r in probe.rows)
-        lines.append(f"| {rows} | {probe.kind} | {probe.bounds} | {probe.on} | {probe.source} | {probe.complexity} | {cost} |")
+        lines.append(f"| {rows} | {probe.kind} | {probe.bounds} | {probe.on} | {probe.source} | {probe.complexity} "
+                     f"| {cost} |")
     return "\n".join(lines)
 
 
@@ -808,14 +773,15 @@ def _check_measure_args(c: Any, slow: Any) -> None:
 
 
 def _size(c: ConnectedComponent, unit: str) -> int:
-    """What a row's max_size counts: the "tensors", the "indices", the "edges" of H, the "pairs" of tensors of the
-    cut graph (an index of r tensors makes r (r - 1) / 2) or "tensors + pairs", the vertices and edges of the cut graph."""
+    """The size of c in `unit`, what a row's max_size counts (Probe.unit)."""
+    if unit == "tensors":
+        return c.n
     if unit == "indices":
         return len(c.indices)
     if unit == "edges":
         return c.H.number_of_edges()
-    pairs = sum(r * (r - 1) // 2 for r in c.ranks.values())
-    return {"tensors": c.n, "pairs": pairs, "tensors + pairs": c.n + pairs}[unit]
+    pairs = sum(r * (r - 1) // 2 for r in c.ranks.values())      # "pairs" or "tensors + pairs"
+    return pairs if unit == "pairs" else c.n + pairs
 
 
 # rows go to JSON: no numpy scalars, no inf or nan
@@ -832,12 +798,10 @@ def _plain(x: Any) -> Value:
 
 
 def measure(c: ConnectedComponent, slow: bool = True) -> dict[str, Any]:
-    """All descriptors of one component: one line of results/descriptors/<name>.jsonl.
+    """Every row of DESCRIPTORS on c: one line of results/descriptors/<name>.jsonl.
 
-    Every probe of DESCRIPTORS on c. With slow=False only the fast probes run (the others are listed as
-    skipped). Deterministic: c.seed feeds every random choice; raises ValueError on bad arguments.
-    Out: {"id": c.id, <one key per row of the table>, "skipped": [rows not computed], "seconds": {probe:
-    seconds, "total": seconds}}. A value is None where it is not defined or was skipped."""
+    {"id": c.id, <row>: value, ..., "skipped": [rows not run], "seconds": {probe: s, "total": s}}. A value is None
+    where it is not defined or was skipped. slow=False runs the fast probes only. Deterministic (c.seed)."""
     _check_measure_args(c, slow)
     row: dict[str, Any] = {"id": c.id}
     skipped = []
@@ -866,19 +830,24 @@ def measure(c: ConnectedComponent, slow: bool = True) -> dict[str, Any]:
 # --- the descriptors file: one row per component id --------------------------------------------
 
 def save(path: Path, row: dict[str, Any]) -> None:
-    """Append one row (measure()) to the file: the slow measurements keep every row that finished. The meta is
-    written by the script that makes the file (config.write_meta)."""
+    """Append one row (measure()): a long run keeps every row that finished. The meta is written by script 02."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(config.json_line(row) + "\n")
 
 
 def load(path: Path, slow: bool = True, seed: int = 0) -> dict[str, dict[str, Any]]:
-    """{component id: row} of the file. FileNotFoundError, naming the script to run, if there is no file;
-    ValueError if its meta is missing or says another table_id (a row, a group or a cap changed, or the fast
-    rows against all of them) or another seed."""
+    """{component id: row} of the file. FileNotFoundError (naming script 02) without the file; ValueError if its
+    meta is missing or has another table_id or seed."""
     if not path.exists():
         raise FileNotFoundError(f"{path} does not exist: run scripts/02_compute_descriptors.py")
-    config.read_meta(path, "Run scripts/02_compute_descriptors.py with --fresh.", table_id=table_id(slow), seed=seed)
-    with open(path, encoding="utf-8") as fh:
-        return {row["id"]: row for row in map(json.loads, fh)}
+    config.load_meta(path, "Run scripts/02_compute_descriptors.py with --fresh.", table_id=table_id(slow), seed=seed)
+    return {row["id"]: row for row in config.load_lines(path)}
+
+
+def load_components(path: Path) -> dict[str, list[tuple[str, int]]]:
+    """{instance id: [(component id, tensors)]}, largest first (split()), from the components file of script 02.
+    FileNotFoundError (naming script 02) without the file."""
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist: run scripts/02_compute_descriptors.py")
+    return {line["instance"]: [(cid, n) for cid, n in line["components"]] for line in config.load_lines(path)}

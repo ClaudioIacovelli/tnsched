@@ -266,6 +266,7 @@ def test_the_knobs_are_stored_in_knobs_order_and_printed_by_name_and_member():
     assert gen("randreg", 16, 0, degree=3).member == "randreg-degree3" and gen("tree", 16, 0).member == "tree"
     assert Instance(lat.inputs, lat.output, lat.size_dict, "benchmark", {"n": 27, "name": "x"}, None).name == "benchmark-x"
     assert Instance(lat.inputs, lat.output, lat.size_dict, "benchmark", {"n": 27}, None).member == "benchmark"
+    assert instances.member_name("geometric", {"dim": 3, "r_scale": 1.4}) == geo.member and instances.member_name("benchmark", {}) == "benchmark"
 
 
 def test_numpy_integers_and_floats_are_accepted_where_ints_and_reals_are_meant():

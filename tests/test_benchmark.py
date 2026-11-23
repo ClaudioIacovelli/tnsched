@@ -13,7 +13,7 @@ from tnsched import benchmark, config, suite
 from tnsched.benchmark import _NumpyOnlyUnpickler
 from tnsched.instances import graph_to_tn, tn_to_graph
 
-needs_benchmark = pytest.mark.skipif(not any(config.BENCHMARK.glob("*.pkl")), reason=f"no Einsum Benchmark in {config.BENCHMARK}")
+needs_benchmark = pytest.mark.skipif(not any(config.BENCHMARK_DIR.glob("*.pkl")), reason=f"no Einsum Benchmark in {config.BENCHMARK_DIR}")
 
 
 def test_the_unpickler_reads_numpy_arrays_and_refuses_any_other_global():

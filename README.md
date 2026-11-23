@@ -1,52 +1,49 @@
 # tnsched
 
-Learning to contract tensor networks: a dataset of networks of known structure, the numbers
-that describe that structure, and the input a graph neural network reads from each network.
+Learning to contract tensor networks: a dataset of networks of known structure, the numbers that describe that
+structure, and the input a graph neural network reads from each network.
 
 ## What it is for
-The cost of contracting a tensor network depends on the order in which its tensors are
-contracted, and the best order is NP-hard to find [XZL23]. The cost of the best order is set by
-the structure of the network: its treewidth, how well it splits into balanced halves, how fast it
-grows [MS08, GK21]. tnsched builds networks whose structure is known by construction (lattices,
-random regular graphs, random geometric graphs, small worlds, trees, hypergraph networks) and
-measures, for each, bounds and estimates of these quantities on the graph alone.
+The cost of contracting a tensor network depends on the order in which its tensors are contracted, and the best
+order is NP-hard to find [XZL23]. The cost of the best order is set by the structure of the network: its treewidth,
+how well it splits into balanced halves, how fast it grows [MS08, GK21]. tnsched builds networks whose structure is
+known by construction (lattices, random regular graphs, random geometric graphs, small worlds, trees, hypergraph
+networks) and measures, for each, bounds and estimates of these quantities on the graph alone.
 
 ## Scope
-- `instances`: one network, rebuilt bit for bit from its recipe (family and its knobs, size, seed,
-  bond dimensions, open legs). Only structure is stored, never arrays.
+- `instances`: one network, rebuilt bit for bit from its recipe (family and its knobs, size, seed, bond dimensions,
+  open legs). Only structure is stored, never arrays.
 - `suite`: which networks make the dataset, and the file that stores them.
-- `descriptors`: the structural numbers of a network, each a bound or an estimate of a quantity
-  that bounds the contraction cost, with its cost of computation and the theorem behind it.
-- `features`: the input of a graph neural network for each component: a few numbers per tensor and
-  per index, and the return probabilities of a random walk [DLL22], as numpy arrays.
-- `benchmark`: a loader for the Einsum Benchmark [BSK24], the real-world test set, taken as it comes.
+- `descriptors`: the structural numbers of a network, each a bound or an estimate of a quantity that bounds the
+  contraction cost, with its cost of computation and the theorem behind it.
+- `features`: the input of a graph neural network for each component, as numpy arrays: a few numbers per tensor and
+  per index, the return probabilities of a random walk [DLL22], and the sizes of the balls around each node.
+- `benchmark`: a loader for the Einsum Benchmark [BSK24], real-world networks taken as they come.
 
-These are the inputs of a learned contraction scheduler: a graph neural network that reads the
-features and is trained to predict a contraction order, with the descriptors as auxiliary targets. The scheduler is not part
-of this release.
+These are the inputs of a learned contraction scheduler: a graph neural network that reads the features and is
+trained to predict a contraction order, with the descriptors as auxiliary targets. The scheduler is not part of this
+release.
 
 ## What is new
-Auxiliary targets for graph neural networks are known [Car97, CCB20], and so are learned
-contraction orders [MMM22, GHS22, KSO20]. What we did not find is a model that learns the
-contraction order together with descriptors that bound its cost (the weighted treewidth of the
-index graph, which equals the largest step of the best contraction tree [MS08]; the balanced cut
-and its scaling exponent; the growth dimension), measured on hypergraph networks across classes
-and sizes. This release provides the dataset and the descriptors that such a model needs.
+Auxiliary targets for graph neural networks are known [Car97, CCB20], and so are learned contraction orders
+[MMM22, GHS22, KSO20]. What we did not find is a model that learns the contraction order together with descriptors
+that bound its cost (the weighted treewidth of the index graph, which equals the largest step of the best
+contraction tree [MS08]; the balanced cut and its scaling exponent; the growth dimension), measured on hypergraph
+networks across classes and sizes. This release provides the dataset and the descriptors that such a model needs.
 
 ## Install
 Python 3.11 or later.
 
     python -m pip install -e .
 
-installs the package (numpy, scipy, networkx and cotengra) in editable mode; the scripts import
-it, so they run from any folder. The Einsum Benchmark (optional, 552 MB, 168 networks) is at
-[doi:10.5281/zenodo.11477304](https://doi.org/10.5281/zenodo.11477304):
+installs the package (numpy, scipy, networkx and cotengra) in editable mode; the scripts import it, so they run
+from any folder. `python -m pip install -e ".[test]"` adds pytest for the tests. The Einsum Benchmark (optional,
+552 MB, 168 networks) is at [doi:10.5281/zenodo.11477304](https://doi.org/10.5281/zenodo.11477304):
 
     python scripts/00_get_benchmark.py
 
-downloads `instances.zip`, checks its md5 and unzips it into `data/einsum_benchmark/`. Pass
-`--zip PATH` to use a copy already on disk, or set `TNSCHED_BENCHMARK` to read the instances from
-another folder.
+downloads `instances.zip`, checks its md5 and unzips it into `data/einsum_benchmark/`. `--zip PATH` uses a copy
+already on disk; the environment variable `TNSCHED_BENCHMARK` reads the instances from another folder.
 
 ## Run
 
@@ -57,15 +54,17 @@ another folder.
     python scripts/03_compute_features.py --suite results/instances/reference.jsonl
                                                              # -> results/features/reference.npz and reference.meta.json
 
-`01 --build` takes a suite of `suite.SUITES` (`reference`, `classifier`) or `manual`; `--benchmark` adds the 168
-benchmark networks. The meta of every file stores what was asked and its id, and a file is reused only for the same
-request. A manual build, or a suite changed by `--max-n`, `--seeds` or `--bonds`, gets the date and time in its name
-(`manual_20261118-101500.jsonl`); `--tag NAME` names the file instead (`<tag>_<suite>.jsonl`). `02` measures every
-distinct component of an instances file into a descriptors file named after it (one row per component id) and can be
-stopped and resumed; `03` writes the features of every component. Scripts 02 and 03 pick the instances file with
-`--suite PATH`, with `--build`, or by asking.
+- `01 --build` takes a suite of `suite.SUITES` (`reference`, `classifier`) or `manual`; `--benchmark` adds the 168
+  benchmark networks. Every file's meta stores what was asked, and a file is reused only for the same request. A
+  manual build, or a suite changed by `--max-n`, `--seeds` or `--bonds`, gets the date and time in its name
+  (`manual_20261118-101500.jsonl`); `--tag NAME` names the file instead (`<tag>_<suite>.jsonl`).
+- `02` measures every distinct component of an instances file into a descriptors file named after it (one row per
+  component id); it can be stopped and resumed.
+- `03` writes the features of every component.
+- 02 and 03 pick the instances file with `--suite PATH`, with `--build`, or by asking.
 
-A manual build gives the family and all its knobs as JSON (in Windows PowerShell 5.1 the inner quotes need a backslash):
+A manual build gives the family and all its knobs as JSON (in Windows PowerShell 5.1 the inner quotes need a
+backslash):
 
     python scripts/01_build_instances.py --build manual --family lattice --knobs '{"dim": 2}' --sizes 16 64 --seeds 0
     python scripts/01_build_instances.py --build manual --family lattice --knobs '{\"dim\": 2}' --sizes 16 64 --seeds 0   # Windows PowerShell 5.1
@@ -86,14 +85,14 @@ From Python:
     src/tnsched/instances.py     one network: families, bond rules, open legs, the Instance record
     src/tnsched/suite.py         Suite, SUITES (reference, classifier); build, save, load
     src/tnsched/descriptors.py   the table of descriptors and measure()
-    src/tnsched/features.py      the input of the model: FEATURES, rwpe, component_input
+    src/tnsched/features.py      the input of the model: NATIVE_FEATURES, rwpe, ball_sizes, component_input, split_labels, samples, unseen
     src/tnsched/benchmark.py     the Einsum Benchmark loader
-    src/tnsched/config.py        paths
+    src/tnsched/config.py        paths, the JSON-lines format, the meta file beside every file
     scripts/                     00 get the benchmark, 01 build a suite, 02 measure the descriptors, 03 compute the features; _shared.py is what 01, 02 and 03 share
     tests/                       one test file per module, and test_scripts.py for scripts/
     docs/                        one page per module: instances.md (with the benchmark), suite.md, descriptors.md, features.md
     results/instances/           reference.jsonl and classifier.jsonl, each with its meta (the stored suites and what built them)
-    results/descriptors/         the descriptors of both suites (.jsonl, .meta.json, _class_table.md); the features are made by 03, not stored
+    results/descriptors/         the descriptors of both suites (.jsonl, .meta.json, _class_table.md, _components.jsonl); the features are made by 03, not stored
 
 ## Authorship
 Claudio Iacovelli designed tnsched (the modules in src/, the scripts and the tests: what each one computes and how the

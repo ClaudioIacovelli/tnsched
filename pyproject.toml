@@ -13,6 +13,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Claudio Iacovelli" }]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

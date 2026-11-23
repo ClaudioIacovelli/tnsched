@@ -1,8 +1,7 @@
 """Get the Einsum Benchmark: download instances.zip from Zenodo, check its md5, unzip.
 
-The 168 instances (552 MB zipped, 1.3 GB unpacked) go to data/einsum_benchmark/instances/,
-where config.BENCHMARK reads them. With --zip, an instances.zip already on disk is used instead
-of the download; it is checked the same way.
+The 168 instances (552 MB zipped, 1.3 GB unpacked) go to data/einsum_benchmark/instances/, where
+config.BENCHMARK_DIR reads them. --zip uses an instances.zip already on disk instead, checked the same way.
 
 Usage: python scripts/00_get_benchmark.py [--zip PATH] [--dest DIR] [--force]
 """
@@ -22,7 +21,7 @@ N_INSTANCES = 168                                            # and what it promi
 
 
 def unzip(archive: Path, dest: Path) -> None:
-    """Extract only instances/*.pkl: refuse any member that is not a .pkl file directly in dest/instances."""
+    """Extract instances/*.pkl into dest; ValueError for any other member (a zip can name paths outside dest)."""
     dest = dest.resolve()
     with zipfile.ZipFile(archive) as z:
         for member in z.namelist():
@@ -39,7 +38,7 @@ def unzip(archive: Path, dest: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--zip", type=Path, help="use this instances.zip instead of downloading")
-    ap.add_argument("--dest", type=Path, default=config.BENCHMARK.parent)
+    ap.add_argument("--dest", type=Path, default=config.BENCHMARK_DIR.parent)
     ap.add_argument("--force", action="store_true", help="unzip even if the instances are there")
     args = ap.parse_args()
 

@@ -82,11 +82,11 @@ REFERENCE = {
     "index4": {"n_indices": 1, "n_incidences": 4, "n_hyperedges": 1, "hyperedge_fraction": 1.0, "diameter": 1, "girth": None,
                "_degeneracy": 1, "_mmd": 1, "_spectral_tw": 0, "tw_lower": 1, "tw_upper": 1,
                "tw_w_lower": 2.0, "tw_w_upper": 2.0, "b_upper": 2.0, "lambda_2_cut": 2.0,
-               "b_lower": 16 / 9, "planar": True, "max_hyperedge_size": 4, "ball_dimension": None},
+               "b_lower": 16 / 9, "planar": True, "hyperedge_size_max": 4, "ball_dimension": None},
     "index4+bond": {"girth": 2, "diameter": 1},
     "index5": {"planar": True, "diameter": 1, "girth": None, "genus_lower": 0},                # the primal graph would be K_5
     "ring4 doubled": {"diameter": 2, "girth": 4, "n_indices": 4},
-    "mixed ranks": {"n_tensors": 4, "n_indices": 3, "n_hyperedges": 1, "mean_log2_d": 2.0},   # (1 + 3 + 2) / 3 over the indices, not over the edges of H
+    "mixed ranks": {"n_tensors": 4, "n_indices": 3, "n_hyperedges": 1, "log2_d_mean": 2.0},   # (1 + 3 + 2) / 3 over the indices, not over the edges of H
 }
 PRIVATE = {"_degeneracy": lambda c: D._degeneracy(c.H), "_mmd": lambda c: D._mmd(c.H), "_spectral_tw": D._spectral_tw}   # the methods behind tw_lower
 
@@ -124,8 +124,8 @@ def test_the_closed_forms_of_cycles_complete_graphs_and_grids(n):
     assert row(G, "lambda_2") == pytest.approx(2 * (1 - math.cos(math.pi / L)))
     assert L <= row(G, "tw_upper") <= 2 * L and abs(row(G, "b_upper") - L) <= 2
     assert row(G, "n_tensors") == L * L and row(G, "n_indices") == 2 * L * (L - 1) and row(G, "n_incidences") == 4 * L * (L - 1)
-    assert row(G, "n_hyperedges") == 0 and row(G, "max_hyperedge_size") == 2 and row(G, "mean_log2_d") == 1.0 and row(G, "std_log2_d") == 0.0
-    assert row(G, "max_degree") == 4 and row(G, "mean_degree") == pytest.approx(4 * L * (L - 1) / (L * L))
+    assert row(G, "n_hyperedges") == 0 and row(G, "hyperedge_size_max") == 2 and row(G, "log2_d_mean") == 1.0 and row(G, "log2_d_std") == 0.0
+    assert row(G, "degree_max") == 4 and row(G, "degree_mean") == pytest.approx(4 * L * (L - 1) / (L * L))
 
 
 # --- the component and split -------------------------------------------------------------------------
@@ -325,7 +325,7 @@ def test_the_double_sweep_never_exceeds_the_diameter():
 # --- the dimension rows --------------------------------------------------------------------------------
 
 BALL_ROWS = ("ball_exponential", "ball_dimension", "ball_growth_rate")
-WALK_ROWS = ("walk_exponential", "spectral_dimension", "walk_decay_rate")
+WALK_ROWS = ("walk_exponential", "walk_dimension", "walk_decay_rate")
 
 
 def law(x, rows):
@@ -340,11 +340,11 @@ def test_lattices_and_rings_grow_as_power_laws_with_their_dimension():
         exponential, dimension, rate = law(nx.cycle_graph(512), rows)
         assert exponential is False and 0.8 < dimension < 1.2 and rate is None, rows
     assert law(nx.path_graph(2), BALL_ROWS) == (None, None, None)                                    # no source has 4 radii
-    assert 1.6 < row(grid(32), "spectral_dimension") < 2.4
-    assert row(nx.cycle_graph(4096), "spectral_dimension") == pytest.approx(1.0, abs=0.05)
-    assert row(nx.convert_node_labels_to_integers(nx.grid_2d_graph(64, 64, periodic=True)), "spectral_dimension") == pytest.approx(2.0, abs=0.2)    # 2.160 measured
-    assert row(nx.convert_node_labels_to_integers(nx.grid_graph([16] * 3, periodic=True)), "spectral_dimension") == pytest.approx(3.0, abs=0.3)   # 3.26 measured
-    assert row(nx.complete_graph(8), "spectral_dimension") is None                                  # too small for a window
+    assert 1.6 < row(grid(32), "walk_dimension") < 2.4
+    assert row(nx.cycle_graph(4096), "walk_dimension") == pytest.approx(1.0, abs=0.05)
+    assert row(nx.convert_node_labels_to_integers(nx.grid_2d_graph(64, 64, periodic=True)), "walk_dimension") == pytest.approx(2.0, abs=0.2)    # 2.160 measured
+    assert row(nx.convert_node_labels_to_integers(nx.grid_graph([16] * 3, periodic=True)), "walk_dimension") == pytest.approx(3.0, abs=0.3)   # 3.26 measured
+    assert row(nx.complete_graph(8), "walk_dimension") is None                                  # too small for a window
 
 
 def test_expanders_grow_exponentially_and_have_no_dimension():
@@ -353,7 +353,7 @@ def test_expanders_grow_exponentially_and_have_no_dimension():
         for rows in (BALL_ROWS, WALK_ROWS):
             exponential, dimension, rate = law(c, rows)
             assert exponential is True and dimension is None and rate > 0, (seed, rows)
-        assert row(c, "spectral_dimension") is None
+        assert row(c, "walk_dimension") is None
 
 
 def test_the_ball_regime_is_the_majority_and_a_tie_is_power(monkeypatch):
@@ -370,8 +370,8 @@ def test_the_fit_tells_the_two_laws_apart_and_refuses_too_few_points():
     x = np.arange(1, 11, dtype=float)
     assert D._fit_both(x, 2 * np.log(x) + 1, 6) == ("power", pytest.approx(2.0))
     assert D._fit_both(x, 0.7 * x + 1, 6) == ("exponential", pytest.approx(0.7))                    # the log of an exponential is a line in x
-    assert (D.MIN_BALL_POINTS, D.MIN_WALK_POINTS) == (4, 6)                                          # balls have at most ecc/2 radii
-    for least in (D.MIN_BALL_POINTS, D.MIN_WALK_POINTS):
+    assert (D.BALL_MIN_POINTS, D.WALK_MIN_POINTS) == (4, 6)                                          # balls have at most ecc/2 radii
+    for least in (D.BALL_MIN_POINTS, D.WALK_MIN_POINTS):
         few = x[:least]
         assert D._fit_both(few, 2 * np.log(few), least) == ("power", pytest.approx(2.0))
         assert D._fit_both(few[:-1], 2 * np.log(few[:-1]), least) == (None, None)
@@ -394,22 +394,22 @@ def test_the_return_probability_never_rises_and_the_walk_stops_when_mixed():
     below MIX_FACTOR pi: every step before it is in the window, none after it would be."""
     for c in (graph_component(grid(8)), graph_component(nx.cycle_graph(64)), component(bonds(nx.complete_graph(8))),
               largest(gen("randreg", 64, 0)), largest(gen("hyper", 64, 0))):
-        p, pi = D._return_probability(c)
+        p, pi = D._return_probability_mean(c)
         assert np.all(np.diff(p) <= 1e-12) and p.min() > pi - 1e-12
         assert np.all(p[:-1] >= D.MIX_FACTOR * pi)
-        assert len(p) == D.MAX_WALK_STEPS or p[-1] < D.MIX_FACTOR * pi
+        assert len(p) == D.WALK_MAX_STEPS or p[-1] < D.MIX_FACTOR * pi
 
 
 def test_the_walk_is_longer_on_a_ring_than_on_an_expander():
-    ring, _ = D._return_probability(graph_component(nx.cycle_graph(512)))
-    expander, _ = D._return_probability(largest(gen("randreg", 1024, 0)))
-    assert len(ring) == D.MAX_WALK_STEPS and len(expander) < 100
+    ring, _ = D._return_probability_mean(graph_component(nx.cycle_graph(512)))
+    expander, _ = D._return_probability_mean(largest(gen("randreg", 1024, 0)))
+    assert len(ring) == D.WALK_MAX_STEPS and len(expander) < 100
 
 
 @pytest.mark.parametrize("seed", range(3))
-def test_on_random_trees_the_spectral_dimension_reads_between_1_2_and_1_5(seed):
+def test_on_random_trees_the_walk_dimension_reads_between_1_2_and_1_5(seed):
     """Known limit: a random tree has d_s = 4/3 in the limit, and the row reads 1.29 to 1.46 at n = 1024, one tree at a time."""
-    assert 1.2 < row(largest(gen("tree", 1024, seed)), "spectral_dimension") < 1.5
+    assert 1.2 < row(largest(gen("tree", 1024, seed)), "walk_dimension") < 1.5
 
 
 @pytest.mark.parametrize("p", [0.05, 0.1])
@@ -476,9 +476,9 @@ def test_every_row_belongs_to_one_probe_and_every_column_takes_an_allowed_value(
     by = lambda b: {r for r, p in D.ROWS.items() if p.bounds == b}
     assert by("b") == {"b_lower", "b_upper"} and by("W") == set() and by("T") == {"tw_w_lower", "tw_w_upper"}
     assert by("tw") == {"tw_lower", "tw_upper"} and D.ROWS["tw_w_lower"].on == D.ROWS["tw_w_upper"].on == "index graph"
-    assert by("D") == set(D.ROWS["ball_dimension"].rows + D.ROWS["spectral_dimension"].rows)
-    assert D.ROWS["ball_dimension"].rows == BALL_ROWS and D.ROWS["spectral_dimension"].rows == WALK_ROWS
-    assert D.ROWS["n_tensors"].rows == ("n_tensors", "n_indices", "n_incidences", "mean_log2_d", "std_log2_d")
+    assert by("D") == set(D.ROWS["ball_dimension"].rows + D.ROWS["walk_dimension"].rows)
+    assert D.ROWS["ball_dimension"].rows == BALL_ROWS and D.ROWS["walk_dimension"].rows == WALK_ROWS
+    assert D.ROWS["n_tensors"].rows == ("n_tensors", "n_indices", "n_incidences", "log2_d_mean", "log2_d_std")
 
 
 def test_the_module_defines_the_probes_in_the_order_of_the_table():
@@ -571,7 +571,7 @@ def test_save_appends_rows_and_load_reads_them_by_id(tmp_path):
     """save appends one row to the file (the meta is the script's); load gives {component id: row}."""
     path = tmp_path / "d" / "x.jsonl"
     rows = [D.measure(largest(gen("randreg", 16, 0))), D.measure(largest(gen("tree", 16, 0)))]
-    config.write_meta(path, table_id=D.table_id(), seed=0)
+    config.save_meta(path, table_id=D.table_id(), seed=0)
     D.save(path, rows[0])
     D.save(path, rows[1])
     loaded = D.load(path)
@@ -582,7 +582,7 @@ def test_save_appends_rows_and_load_reads_them_by_id(tmp_path):
 @pytest.mark.parametrize("what, load_args", [("table_id", {"slow": False}), ("seed", {"seed": 7})])
 def test_a_file_of_another_table_slow_or_seed_is_refused_and_says_what_to_do(tmp_path, what, load_args):
     path = tmp_path / "x.jsonl"
-    config.write_meta(path, table_id=D.table_id(), seed=0)
+    config.save_meta(path, table_id=D.table_id(), seed=0)
     D.save(path, D.measure(largest(gen("tree", 16, 0))))
     with pytest.raises(ValueError, match=what + ".*--fresh"):
         D.load(path, **load_args)

@@ -1,25 +1,30 @@
 # suite: the dataset
 
-A `Suite` is `members, seeds, bonds, recipes`; `SUITES` names them. `reference` (`MEMBERS`, `SEEDS`, `BONDS`,
-`LEG_RECIPES`) is the test set; `classifier` (closed networks only, more members and sizes, seeds 1000-1009, uniform
-and spread bonds) is the training set. A member is a family with every knob, and the sizes it is drawn at.
-`build(suite)` runs plan -> generate each entry -> drop duplicates (same id) -> add the Einsum Benchmark
-networks if asked [BSK24], and `save` / `load` write and read one JSON line per instance: the recipe and the
-id, never arrays. The line is compact JSON (no spaces after `,` and `:`; `config.json_line`, the form of every
-file the package writes), with the characters that `str.splitlines()` takes for a line break written as `\u0085`,
-` ` and ` `, so that no editor cuts a record there. `load` rebuilds every instance and checks its id. With seeds 0-2 and uniform bonds the
-reference suite holds 583 instances; a bigger dataset is more rows of a suite. The two suites share some
-networks (a closed uniform lattice does not depend on the seed): they have the same id.
+A `Suite` is `members, seeds, bonds, legs`; a member is a family with every knob and the sizes it is drawn at. Every
+combination is one instance. `SUITES` holds two:
+- `reference`, the test set: 10 members, seeds 0-2, uniform bonds, four legs families. 583 instances.
+- `classifier`, the training set: closed networks only, 17 members and more sizes, seeds 1000-1009, uniform and spread
+  bonds.
+
+The two share some networks (a closed uniform lattice does not depend on the seed); a shared network has the same id
+in both. A bigger dataset is more rows of a suite.
+
+`build(suite)` runs plan -> generate each entry -> drop duplicates (same id) -> add the Einsum Benchmark networks if
+asked [BSK24]. `save` writes one JSON line per instance: the recipe and the id, never arrays (`config.json_line`, the
+form of every file the package writes). `load` rebuilds every instance and checks its id.
 
 ## How many open legs
-The legs of scattered and region weigh a share of the network's width, W = c n^alpha bits, so
-they keep the same weight relative to the width at every size. alpha comes from theory (tree 0;
-2D lattice and geometric 1/2; 3D 2/3; random regular, small world and hyper 1); c is the
-geometric mean of W / n^alpha over seeds 0-2 at the member's sizes, with W the width of
-cotengra's greedy path [GK21]. These numbers only set how many legs a recipe places.
+The legs of scattered and region weigh a share of the network's width W, so they keep the same weight relative to
+the width at every size. W = c n^alpha bits, W the width of cotengra's greedy path [GK21]: alpha from theory (tree 0;
+2D lattice and geometric 1/2; 3D 2/3; random regular, small world and hyper 1), c the geometric mean of W / n^alpha
+over seeds 0-2 at the member's sizes. These two numbers only set how many legs are placed.
+
+The share is chosen: `Suite.legs` maps each legs family to its shares (reference: scattered 0.5, region 0.5 and 1.5,
+closed and mps none), one instance per share. Then k = max(1, round(share c n^alpha)), at most n for a region; closed
+has k = 0, mps k = n. A member without alpha and c cannot get scattered or region legs: `plan` raises a ValueError.
 
 ## Reproducibility
-`<name>.meta.json` stores, next to the data, what was asked (the members with their knobs and sizes, the seeds, bond
-rules and recipes, chi, the benchmark) and its id, the flags of script 01, the date and the library versions
-(`config.library_versions`). Script 01 reuses a file only for the same request. Other versions of networkx, numpy or
-cotengra may draw other networks from the same seed; a slow test compares a fresh `build()` with the stored file.
+`<name>.meta.json`, beside the data, stores what was asked (members with knobs and sizes, seeds, bond rules, legs with
+their shares, chi, the benchmark) and its id, the flags of script 01, the date and the library versions. Script 01
+reuses a file only for the same request. Other versions of networkx, numpy or cotengra may draw other networks from
+the same seed; a slow test compares a fresh `build()` with the stored file.

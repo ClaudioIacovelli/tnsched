@@ -20,15 +20,15 @@ from conftest import gen
 
 from tnsched import benchmark, config, descriptors, features, suite
 
-sys.path.insert(0, str(config.ROOT / "scripts"))
+sys.path.insert(0, str(config.ROOT_DIR / "scripts"))
 import _shared                                                  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def results_in_a_temporary_folder(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "INSTANCES", tmp_path / "instances")
-    monkeypatch.setattr(config, "DESCRIPTORS", tmp_path / "descriptors")
-    monkeypatch.setattr(config, "FEATURES", tmp_path / "features")
+    monkeypatch.setattr(config, "INSTANCES_DIR", tmp_path / "instances")
+    monkeypatch.setattr(config, "DESCRIPTORS_DIR", tmp_path / "descriptors")
+    monkeypatch.setattr(config, "FEATURES_DIR", tmp_path / "features")
 
 
 def parse(*flags):
@@ -39,7 +39,7 @@ def parse(*flags):
 
 def script(name):
     """scripts/<name>.py as a module (their names start with a digit, so they cannot be imported by name)."""
-    spec = importlib.util.spec_from_file_location(name, config.ROOT / "scripts" / f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, config.ROOT_DIR / "scripts" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -67,26 +67,27 @@ def test_json_line_is_one_line_even_for_splitlines_and_json_loads_gives_the_valu
 
 def test_write_meta_adds_the_library_versions_and_the_date_and_writes_paths_as_text(tmp_path):
     path = tmp_path / "d" / "x.jsonl"
-    config.write_meta(path, request_id="abc", flags={"suite": tmp_path})
-    meta = config.read_meta(path, request_id="abc")
+    config.save_meta(path, request_id="abc", flags={"suite": tmp_path})
+    meta = config.load_meta(path, request_id="abc")
     assert meta["flags"] == {"suite": str(tmp_path)} and {"python", "numpy", "scipy", "networkx", "cotengra", "date"} <= set(meta)
-    assert "torch" not in meta and config.meta_path(path).name == "x.meta.json"
+    assert config.meta_path(path).name == "x.meta.json"
     assert len(config.meta_path(path).read_text(encoding="utf-8").splitlines()) == 1                # a meta is one line
 
 
-def test_read_meta_names_the_file_and_every_key_that_differs_and_ends_with_the_advice(tmp_path):
+def test_load_meta_names_the_file_and_every_key_that_differs_and_ends_with_the_advice(tmp_path):
     path = tmp_path / "x.jsonl"
-    config.write_meta(path, a=1, b=2)
+    config.save_meta(path, a=1, b=2)
     with pytest.raises(ValueError, match=r"x\.jsonl.*a: the file has 1, now 5.*b: the file has 2, now 6.*run it again$"):
-        config.read_meta(path, "run it again", a=5, b=6)
+        config.load_meta(path, "run it again", a=5, b=6)
     with pytest.raises(ValueError, match="no meta file.*run it again"):
-        config.read_meta(tmp_path / "y.jsonl", "run it again")
+        config.load_meta(tmp_path / "y.jsonl", "run it again")
 
 
 def test_the_paths_of_the_files_are_named_after_the_instances_file():
-    path = config.INSTANCES / "small_classifier.jsonl"
-    assert config.descriptors_path(path) == config.DESCRIPTORS / "small_classifier.jsonl"
-    assert config.features_path(path) == config.FEATURES / "small_classifier.npz"
+    path = config.INSTANCES_DIR / "small_classifier.jsonl"
+    assert config.descriptors_path(path) == config.DESCRIPTORS_DIR / "small_classifier.jsonl"
+    assert config.components_path(path) == config.DESCRIPTORS_DIR / "small_classifier_components.jsonl"
+    assert config.features_path(path) == config.FEATURES_DIR / "small_classifier.npz"
 
 
 def test_the_library_versions_leave_out_what_is_not_installed(monkeypatch):
@@ -100,8 +101,8 @@ def test_the_library_versions_leave_out_what_is_not_installed(monkeypatch):
 
 def test_build_instances_writes_the_file_and_a_meta_with_the_request_its_id_and_the_flags():
     path = _shared.build_instances("classifier", parse(*SMALL))
-    assert path.parent == config.INSTANCES and path.name.startswith("classifier_20")              # --seeds changed the suite: a time
-    meta = config.read_meta(path)
+    assert path.parent == config.INSTANCES_DIR and path.name.startswith("classifier_20")              # --seeds changed the suite: a time
+    meta = config.load_meta(path)
     assert meta["seeds"] == [1000] and meta["bonds"] == ["uniform", "spread"] and meta["chi"] == 2 and meta["benchmark"] is False
     assert meta["n_instances"] == len(suite.load(path)) and len(meta["request_id"]) == 16
     assert meta["flags"]["max_n"] == 16 and meta["members"][0] == {"family": "lattice", "knobs": {"dim": 2}, "sizes": [16], "alpha": None, "c": None}
@@ -151,12 +152,12 @@ def test_a_file_built_with_other_flags_is_not_reused_and_a_file_without_its_meta
 
 def test_pick_instances_takes_a_file_a_build_or_says_what_to_pass():
     built = _shared.build_instances("classifier", parse(*SMALL, "--tag", "s"))
-    assert _shared.pick_instances(parse("--suite", str(built))) == built
-    assert _shared.pick_instances(parse("--build", "classifier", *SMALL, "--tag", "s")) == built
+    assert _shared.choose_instances_path(parse("--suite", str(built))) == built
+    assert _shared.choose_instances_path(parse("--build", "classifier", *SMALL, "--tag", "s")) == built
     with pytest.raises(SystemExit, match="01_build_instances"):
-        _shared.pick_instances(parse("--suite", str(config.INSTANCES / "nope.jsonl")))
+        _shared.choose_instances_path(parse("--suite", str(config.INSTANCES_DIR / "nope.jsonl")))
     with pytest.raises(SystemExit, match="--suite PATH or --build"):
-        _shared.pick_instances(parse())
+        _shared.choose_instances_path(parse())
 
 
 def test_new_components_gives_each_distinct_component_once_skips_the_done_ones_and_keeps_no_graph():
@@ -191,14 +192,14 @@ def test_with_a_keyboard_the_shared_asks_and_takes_the_answer(monkeypatch):
     monkeypatch.setattr("builtins.input", nobody)
     with pytest.raises(SystemExit, match="--tag"):                                                    # no keyboard at all stops too
         _shared.build_instances("classifier", parse("--seeds", "1003", "--max-n", "16", "--tag", "k"))
-    files = sorted(config.INSTANCES.glob("*.jsonl"))
+    files = sorted(config.INSTANCES_DIR.glob("*.jsonl"))
     monkeypatch.setattr("builtins.input", lambda question: "1")
-    assert _shared.pick_instances(parse()) == files[0]                                                  # the menu: a file by its number
+    assert _shared.choose_instances_path(parse()) == files[0]                                                  # the menu: a file by its number
     monkeypatch.setattr("builtins.input", lambda question: "none of these")
     with pytest.raises(SystemExit, match="neither a file number nor a suite"):
-        _shared.pick_instances(parse())
+        _shared.choose_instances_path(parse())
     monkeypatch.setattr("builtins.input", lambda question: "classifier")
-    assert _shared.pick_instances(parse(*SMALL, "--tag", "k2")).name == "k2_classifier.jsonl"          # or a suite to build
+    assert _shared.choose_instances_path(parse(*SMALL, "--tag", "k2")).name == "k2_classifier.jsonl"          # or a suite to build
 
 
 # --- 00: the benchmark -------------------------------------------------------------------------------------
@@ -252,7 +253,7 @@ def test_get_benchmark_downloads_when_it_has_no_zip(tmp_path, monkeypatch, capsy
 def test_every_script_runs_as_a_program_and_says_its_usage_with_help(name, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", [name, "--help"])
     with pytest.raises(SystemExit) as stop:
-        runpy.run_path(str(config.ROOT / "scripts" / f"{name}.py"), run_name="__main__")
+        runpy.run_path(str(config.ROOT_DIR / "scripts" / f"{name}.py"), run_name="__main__")
     assert stop.value.code == 0 and "usage" in capsys.readouterr().out.lower()
 
 
@@ -260,12 +261,15 @@ def test_every_script_runs_as_a_program_and_says_its_usage_with_help(name, monke
 
 def test_the_chain_01_02_03_on_a_tiny_suite_writes_three_files_and_a_second_run_computes_nothing(capsys, monkeypatch):
     run("01_build_instances", "--build", "manual", *LATTICE, "--tag", "tiny", monkeypatch=monkeypatch)
-    path = config.INSTANCES / "tiny_manual.jsonl"
+    path = config.INSTANCES_DIR / "tiny_manual.jsonl"
     assert len(suite.load(path)) == 2 and config.meta_path(path).exists()
     run("02_compute_descriptors", "--suite", str(path), monkeypatch=monkeypatch)
     out = config.descriptors_path(path)
     assert len(descriptors.load(out)) == 2 and out.with_name("tiny_manual_class_table.md").exists() and config.meta_path(out).exists()
     assert "lattice-dim2" in out.with_name("tiny_manual_class_table.md").read_text(encoding="utf-8")
+    components = descriptors.load_components(config.components_path(path))                              # the components of each instance, from 02
+    assert list(components) == [rec["id"] for rec in config.load_lines(path)] and all(n in (16, 25) for cs in components.values() for _, n in cs)
+    assert {cid for cs in components.values() for cid, _ in cs} == set(descriptors.load(out))
     run("03_compute_features", "--suite", str(path), monkeypatch=monkeypatch)
     out3 = config.features_path(path)
     assert len(features.load(out3)) == 2 and config.meta_path(out3).exists()
@@ -280,7 +284,7 @@ def test_the_chain_01_02_03_on_a_tiny_suite_writes_three_files_and_a_second_run_
 
 def test_02_and_03_stop_on_a_file_made_with_other_settings_and_fresh_starts_again(capsys, monkeypatch):
     run("01_build_instances", "--build", "manual", *LATTICE, "--tag", "tiny", monkeypatch=monkeypatch)
-    path = config.INSTANCES / "tiny_manual.jsonl"
+    path = config.INSTANCES_DIR / "tiny_manual.jsonl"
     flags = ("--suite", str(path))
     run("02_compute_descriptors", *flags, "--fast", monkeypatch=monkeypatch)
     with pytest.raises(ValueError, match="table_id.*--fresh"):                                       # a file of the fast probes is not the full file
@@ -303,7 +307,7 @@ def test_02_and_03_resume_with_limit_skip_what_is_too_big_and_measure_the_benchm
     with open(tmp_path / "qc_toy.pkl", "wb") as fh:                                                   # a closed triangle in the benchmark's format
         pickle.dump(("ab,bc,ca->", [np.zeros(s, dtype=np.float32) for s in shapes], (([(0, 1), (0, 1)], 1.0, 1.0),) * 2, None), fh, protocol=4)
     insts = [benchmark.load("qc_toy", tmp_path)] + [gen("tree", 16, seed) for seed in range(25)] + [gen("tree", 16, 0, legs="scattered", k=3)]
-    path = config.INSTANCES / "many.jsonl"
+    path = config.INSTANCES_DIR / "many.jsonl"
     suite.save(insts, path)
     flags = ("--suite", str(path), "--fast")
     run("02_compute_descriptors", *flags, "--limit", "1", monkeypatch=monkeypatch)
@@ -312,8 +316,8 @@ def test_02_and_03_resume_with_limit_skip_what_is_too_big_and_measure_the_benchm
     printed = capsys.readouterr().out
     assert "25 components  " in printed and "25 components measured (1 already there)" in printed
     assert "benchmark" in config.descriptors_path(path).with_name("many_class_table.md").read_text(encoding="utf-8")
-    monkeypatch.setattr(features, "MAX_DENSE", 3)                                                     # the trees have 16 tensors: too big for the dense rwpe
+    monkeypatch.setattr(features, "RWPE_MAX_TENSORS", 3)                                                     # the trees have 16 tensors: too big for the dense rwpe
     run("03_compute_features", "--suite", str(path), "--limit", "1", monkeypatch=monkeypatch)
-    assert "1 components computed (0 already there), 0 above MAX_DENSE = 3 skipped" in capsys.readouterr().out      # the limit stops after one computed
+    assert "1 components computed (0 already there), 0 above RWPE_MAX_TENSORS = 3 skipped" in capsys.readouterr().out      # the limit stops after one computed
     run("03_compute_features", "--suite", str(path), monkeypatch=monkeypatch)
-    assert "0 components computed (1 already there), 25 above MAX_DENSE = 3 skipped" in capsys.readouterr().out    # a component that is too big is counted again
+    assert "0 components computed (1 already there), 25 above RWPE_MAX_TENSORS = 3 skipped" in capsys.readouterr().out    # a component that is too big is counted again

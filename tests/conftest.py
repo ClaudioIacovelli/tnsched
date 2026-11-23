@@ -1,15 +1,17 @@
-"""Shared by the tests: gen(), signature(), component(), graph_component(), and the two suite fixtures."""
+"""Shared by the tests: gen(), signature(), component(), graph_component(), TEST_TARGETS and files_of(), and the two
+suite fixtures."""
 import networkx as nx
 import pytest
 
 from tnsched import descriptors, instances, suite
+from tnsched.features import component_input
 
 
 def gen(family: str, n: int, *args, **kwargs) -> instances.Instance:
     """instances.generate(family, n, *args, **kwargs), where a knob of the family that the call leaves out is
-    taken from the first row of suite.MEMBERS of that family. generate() itself needs every knob; the tests
+    taken from the first row of suite.REFERENCE_MEMBERS of that family. generate() itself needs every knob; the tests
     are not a second table of numbers."""
-    first = next((m for m in suite.MEMBERS if m.family == family), None)       # None: an unknown family, for generate to refuse
+    first = next((m for m in suite.REFERENCE_MEMBERS if m.family == family), None)       # None: an unknown family, for generate to refuse
     knobs = {} if first is None else {name: value for name, value in first.knobs.items() if name not in kwargs}
     return instances.generate(family, n, *args, **kwargs, **knobs)
 
@@ -37,9 +39,26 @@ def graph_component(G: nx.Graph) -> descriptors.ConnectedComponent:
     return descriptors.ConnectedComponent(nx.convert_node_labels_to_integers(G, ordering="sorted"), 0)
 
 
+TEST_TARGETS = ("tw_lower", "planar", "forman_mean", "ball_dimension")     # one of every kind: log, binary, linear, a fit
+
+
+def files_of(insts):
+    """What scripts 01, 02 and 03 write for `insts` (the fast descriptors only): the records of the instances file, the
+    components of each instance (instance id -> [(component id, tensors)]), and the row and the input of each distinct
+    component, by id."""
+    components, rows, inputs = {}, {}, {}
+    for inst in insts:
+        pieces = descriptors.split(inst.core, 0)
+        components[inst.id] = [(c.id, c.n) for c in pieces]
+        for c in pieces:
+            if c.id not in rows:
+                rows[c.id], inputs[c.id] = descriptors.measure(c, slow=False), component_input(c)
+    return [suite.record(inst) for inst in insts], components, rows, inputs
+
+
 @pytest.fixture(scope="session")
 def small_suite() -> list[instances.Instance]:
-    """Every member of the reference suite at its two smallest sizes, seed 0, every leg recipe, both bond rules."""
+    """Every member of the reference suite at its two smallest sizes, seed 0, every legs family and share, both bond rules."""
     reference = suite.SUITES["reference"]
     members = tuple(m._replace(sizes=m.sizes[:2]) for m in reference.members)
     return suite.build(reference._replace(members=members, seeds=(0,), bonds=instances.BOND_RULES))
